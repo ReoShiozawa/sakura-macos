@@ -11,7 +11,7 @@ rsync -aR --exclude='.DS_Store' --exclude='._*' --exclude='__pycache__/' --exclu
   LICENSE LICENSE.macos NOTICE.md README.md README.en.md CONTRIBUTING.md SECURITY.md \
   THIRD_PARTY_NOTICES.md sakura_editor_macos_port_design.md \
   core app platform/mac ui/mac tests/portable tests/mac tests/performance cmake \
-  docs/macos-development.md docs/ASSET_PROVENANCE.md docs/RELEASING.md \
+  docs/macos-development.md docs/ASSET_PROVENANCE.md docs/RELEASING.md docs/releases \
   tools/check_macos_publication.py tools/export_macos_snapshot.sh \
   .github/ISSUE_TEMPLATE .github/PULL_REQUEST_TEMPLATE.md \
   .github/workflows/macos.yml .github/workflows/release-macos.yml \

@@ -121,8 +121,16 @@ install(CODE [[
 install(FILES
   "${PROJECT_SOURCE_DIR}/README.md"
   "${PROJECT_SOURCE_DIR}/README.en.md"
+  "${PROJECT_SOURCE_DIR}/CONTRIBUTING.md"
+  "${PROJECT_SOURCE_DIR}/SECURITY.md"
+  "${PROJECT_SOURCE_DIR}/sakura_editor_macos_port_design.md"
   ${SAKURA_LEGAL_DOCUMENTS}
   DESTINATION "Read Me and Licenses" COMPONENT Runtime)
+install(FILES
+  "${PROJECT_SOURCE_DIR}/docs/ASSET_PROVENANCE.md"
+  "${PROJECT_SOURCE_DIR}/docs/RELEASING.md"
+  "${PROJECT_SOURCE_DIR}/docs/macos-development.md"
+  DESTINATION "Read Me and Licenses/docs" COMPONENT Runtime)
 
 set(CPACK_GENERATOR "DragNDrop")
 set(CPACK_PACKAGE_NAME "Sakura macOS (Unofficial)")

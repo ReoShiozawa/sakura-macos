@@ -10,7 +10,8 @@
 
 このリポジトリの **Security → Advisories → Report a vulnerability** が
 利用できる場合は、そこから非公開で報告してください。
-この機能は所有者による有効化が必要です。現在の公開先・有効化状態は未確認です。
+この機能は所有者による有効化が必要です。
+公開先は https://github.com/ReoShiozawa/sakura-macos/security/advisories です。
 
 ボタンがない場合、公開Issueには攻撃手順・機密ファイル・脆弱性の詳細を書かず、
 「非公開のセキュリティ連絡先を設定してほしい」とだけ依頼してください。
