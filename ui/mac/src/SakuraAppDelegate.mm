@@ -364,7 +364,7 @@ void openURLs(NSDocumentController* controller, NSArray<NSURL*>* urls) {
                                      @selector(findPrevious:), @"G");
   previous.keyEquivalentModifierMask = NSEventModifierFlagCommand |
                                        NSEventModifierFlagShift;
-  NSMenuItem* replace = addMenuItem(searchMenu, @"置換...", 
+  NSMenuItem* replace = addMenuItem(searchMenu, @"置換...",
                                     @selector(replaceSearchSelection:), @"r");
   replace.keyEquivalentModifierMask = NSEventModifierFlagCommand |
                                      NSEventModifierFlagOption;
