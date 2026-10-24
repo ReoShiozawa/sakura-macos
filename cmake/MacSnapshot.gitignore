@@ -1,0 +1,17 @@
+/build/
+/dist/
+.DS_Store
+._*
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+*.p12
+*.p8
+*.keychain-db
+*.private-key
+*.mobileprovision
+*.xcuserstate
+xcuserdata/
+*.code-workspace

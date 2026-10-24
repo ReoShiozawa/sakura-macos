@@ -1,0 +1,35 @@
+name: macOS unofficial port
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: macos-26
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        configuration: [Debug, Release]
+    steps:
+      - name: Check out source (Windows submodules are not required)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0, same pin as upstream
+      - name: Configure
+        run: cmake -S . -B build/ci -DCMAKE_BUILD_TYPE=${{ matrix.configuration }} -DBUILD_TESTING=ON -DSAKURA_BUILD_UNIVERSAL=ON -DCMAKE_OSX_DEPLOYMENT_TARGET=26.0
+      - name: Build
+        run: cmake --build build/ci --parallel 3
+      - name: Test (native host slice)
+        run: ctest --test-dir build/ci --output-on-failure
+      - name: Check source and bundled notices
+        run: python3 tools/check_macos_publication.py --bundle build/ci/ui/mac/SakuraEditor.app
+      - name: Show architectures (not Intel hardware validation)
+        run: lipo -info build/ci/ui/mac/SakuraEditor.app/Contents/MacOS/SakuraEditor

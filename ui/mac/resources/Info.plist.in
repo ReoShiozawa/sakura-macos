@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>ja</string>
+  <key>CFBundleDisplayName</key>
+  <string>${MACOSX_BUNDLE_BUNDLE_NAME}</string>
+  <key>CFBundleExecutable</key>
+  <string>${MACOSX_BUNDLE_EXECUTABLE_NAME}</string>
+  <key>CFBundleIdentifier</key>
+  <string>${MACOSX_BUNDLE_GUI_IDENTIFIER}</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>${MACOSX_BUNDLE_BUNDLE_NAME}</string>
+  <key>CFBundleIconFile</key>
+  <string>${MACOSX_BUNDLE_ICON_FILE}</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>${MACOSX_BUNDLE_SHORT_VERSION_STRING}</string>
+  <key>CFBundleVersion</key>
+  <string>${MACOSX_BUNDLE_BUNDLE_VERSION}</string>
+  <key>SakuraReleaseDisplayVersion</key>
+  <string>${SAKURA_RELEASE_DISPLAY_VERSION}</string>
+  <key>SakuraReleaseTag</key>
+  <string>${SAKURA_RELEASE_TAG}</string>
+  <key>NSPrincipalClass</key>
+  <string>NSApplication</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>${SAKURA_MAC_MINIMUM_SYSTEM_VERSION}</string>
+  <key>NSHumanReadableCopyright</key>
+  <string>Unofficial modified port. Copyright © 2026 Unofficial Sakura macOS port contributors. Upstream: © 2018-2022 Sakura Editor Organization. See bundled Licenses.</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+  <key>NSRequiresAquaSystemAppearance</key>
+  <false/>
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>Plain Text</string>
+      <key>CFBundleTypeRole</key>
+      <string>Editor</string>
+      <key>CFBundleTypeExtensions</key>
+      <array>
+        <string>txt</string>
+        <string>text</string>
+        <string>log</string>
+        <string>md</string>
+        <string>*</string>
+      </array>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.plain-text</string>
+        <string>public.text</string>
+      </array>
+      <key>LSHandlerRank</key>
+      <string>Alternate</string>
+      <key>NSDocumentClass</key>
+      <string>SakuraDocument</string>
+    </dict>
+  </array>
+</dict>
+</plist>

@@ -1,0 +1,32 @@
+name: Build macOS beta DMG
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - name: Configure Universal release
+        run: cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release -DSAKURA_BUILD_UNIVERSAL=ON -DBUILD_TESTING=ON -DCMAKE_OSX_DEPLOYMENT_TARGET=26.0 -DSAKURA_MAC_BUNDLE_IDENTIFIER=io.github.reoshiozawa.sakura-macos
+      - name: Build and test
+        run: |
+          cmake --build build/release --parallel 3
+          ctest --test-dir build/release --output-on-failure
+          python3 tools/check_macos_publication.py --mac-snapshot --bundle build/release/ui/mac/SakuraEditor.app
+      - name: Build DMG (no Developer ID signature or notarization)
+        run: |
+          cpack --config build/release/CPackConfig.cmake -B dist/beta1
+          hdiutil verify dist/beta1/Sakura-macOS-v1.0.0-beta.1-universal.dmg
+      - name: Upload candidate only (publication is a separate reviewed step)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: macos-beta1-dmg
+          path: dist/beta1/*.dmg
+          if-no-files-found: error
+          retention-days: 14
