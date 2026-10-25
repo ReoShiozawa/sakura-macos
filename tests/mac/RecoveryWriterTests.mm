@@ -197,8 +197,18 @@ void coalescingOrderingAndLifetime(NSURL* directory) {
     auto mainTicks = std::make_shared<unsigned>(0);
     NSTimer* timer = [NSTimer scheduledTimerWithTimeInterval:0.002 repeats:YES
         block:^(NSTimer*) { ++*mainTicks; }];
-    check(!pump([&]{ return *idle; }, 0.03), "idle drain cannot precede active I/O");
-    check(*mainTicks > 3 && completed == 0, "main run loop remains responsive during I/O");
+    // Cover delayed delivery deterministically as well as the runner's own
+    // scheduling: no first tick is eligible inside the former 30 ms window.
+    if (mode == 0) timer.fireDate = [NSDate dateWithTimeIntervalSinceNow:0.05];
+    // Timer coalescing and runner scheduling do not guarantee four callbacks
+    // in a fixed 30 ms window. Keep I/O gated until actual main-loop progress
+    // is observed, while an early drain still fails immediately.
+    const bool progressed = pump([&]{ return *mainTicks > 3 || *idle; }, 2);
+    if (!progressed || *mainTicks <= 3 || *idle || completed != 0)
+      std::cerr << "gated I/O mode=" << mode << " timerTicks=" << *mainTicks
+                << " idle=" << *idle << " completions=" << completed << '\n';
+    check(progressed && *mainTicks > 3, "main run loop makes progress during gated I/O");
+    check(!*idle && completed == 0, "idle drain and completions cannot precede active I/O");
     [timer invalidate];
     dispatch_semaphore_signal(events->release);
     check(pump([&]{ return *idle; }), "idle callback follows active and queued operations");
