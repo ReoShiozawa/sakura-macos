@@ -151,6 +151,32 @@ EditMeasurement measureCharacterEdits(sakura::app::DocumentSession& document,
   return result;
 }
 
+EditMeasurement measureStructuralEdits(sakura::app::DocumentSession& document,
+    std::size_t iterations, sakura::core::TextOffset offset) {
+  const auto length = document.buffer().length();
+  const auto lines = document.buffer().lineCount();
+  EditMeasurement result; const auto start = Clock::now();
+  for (std::size_t index=0;index<iterations;++index) {
+    document.insert(offset,u"\r\nZ\r\n");
+    if (document.buffer().length()!=length+5 || document.buffer().lineCount()!=lines+2 ||
+        document.buffer().slice({offset,5})!=u"\r\nZ\r\n")
+      throw std::runtime_error("structural insertion corrupted the document");
+    document.erase({offset,5});
+    if(document.buffer().length()!=length || document.buffer().lineCount()!=lines)
+      throw std::runtime_error("structural deletion corrupted the document");
+    result.checksum+=document.buffer().lineStartOffset(lines-1);
+  }
+  result.editMs=elapsedMilliseconds(start);
+  if(iterations) {
+    const auto undoStart=Clock::now();
+    if(!document.undo() || document.buffer().slice({offset,5})!=u"\r\nZ\r\n" || !document.redo() ||
+        document.buffer().length()!=length || document.buffer().lineCount()!=lines)
+      throw std::runtime_error("structural undo/redo failed");
+    result.undoRedoMs=elapsedMilliseconds(undoStart);
+  }
+  return result;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -172,6 +198,13 @@ int main(int argc, char** argv) {
     // unnecessary retained copy of the source file.
     source.clear();
     source.shrink_to_fit();
+    std::vector<sakura::core::TextBuffer> snapshots;
+    snapshots.reserve(10000);
+    const auto snapshotStart = Clock::now();
+    for (std::size_t index=0;index<10000;++index) snapshots.push_back(document.buffer());
+    const auto snapshotMs = elapsedMilliseconds(snapshotStart);
+    if (&snapshots.front().line(0)!=&document.buffer().line(0))
+      throw std::runtime_error("snapshot copied immutable text payload");
 
     std::unique_ptr<sakura::core::ITextMetrics> metrics = std::make_unique<FixedMetrics>();
 #ifdef SAKURA_BENCHMARK_WITH_CORETEXT
@@ -212,6 +245,11 @@ int main(int argc, char** argv) {
         document, options.editsPerLocation, frontOffset);
     const auto tailEdits = measureCharacterEdits(
         document, options.editsPerLocation, document.buffer().length());
+    const auto frontStructural = measureStructuralEdits(document, options.editsPerLocation, frontOffset);
+    const auto tailStructural = measureStructuralEdits(document, options.editsPerLocation, document.buffer().length());
+    const auto statistics = document.buffer().storageStatistics();
+    if (!statistics.valid || document.buffer().text()!=snapshots.front().text())
+      throw std::runtime_error("edits changed retained snapshot or failed full roundtrip");
     std::cout << std::fixed << std::setprecision(3)
               << "scope=core_load_layout_edit (excludes_AppKit_drawing_and_IME)\n"
 #ifdef NDEBUG
@@ -224,6 +262,9 @@ int main(int argc, char** argv) {
               << "logical_lines=" << document.buffer().lineCount() << '\n'
               << "visual_lines=" << layout.visualLines.size() << '\n'
               << "load_ms=" << loadMs << '\n'
+              << "snapshot_copies=10000\n"
+              << "snapshot_ms=" << snapshotMs << '\n'
+              << "persistent_tree_height=" << statistics.height << '\n'
               << "layout_ms=" << layoutMs << '\n'
               << "lookups=" << options.lookups << '\n'
               << "lookup_ms=" << lookupMs << '\n'
@@ -234,6 +275,10 @@ int main(int argc, char** argv) {
               << "tail_insert_erase_ms=" << tailEdits.editMs << '\n'
               << "front_undo_redo_ms=" << frontEdits.undoRedoMs << '\n'
               << "tail_undo_redo_ms=" << tailEdits.undoRedoMs << '\n'
+              << "front_structural_insert_erase_ms=" << frontStructural.editMs << '\n'
+              << "tail_structural_insert_erase_ms=" << tailStructural.editMs << '\n'
+              << "front_structural_undo_redo_ms=" << frontStructural.undoRedoMs << '\n'
+              << "tail_structural_undo_redo_ms=" << tailStructural.undoRedoMs << '\n'
               << "edit_checksum=" << frontEdits.checksum + tailEdits.checksum << '\n';
     return 0;
   } catch (const std::exception& error) {

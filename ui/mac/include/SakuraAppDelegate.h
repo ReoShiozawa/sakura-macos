@@ -3,5 +3,6 @@
 
 #import <AppKit/AppKit.h>
 
-@interface SakuraAppDelegate : NSObject <NSApplicationDelegate>
+@interface SakuraAppDelegate : NSObject <NSApplicationDelegate, NSMenuDelegate>
+- (void)saveAllDocuments:(id)sender;
 @end

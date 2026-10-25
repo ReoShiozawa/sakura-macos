@@ -15,6 +15,12 @@ endif()
 
 add_test(NAME MacEncodingIntegrationTests COMMAND sakura_mac_encoding_tests)
 
+add_executable(sakura_japanese_encoding_detection_tests JapaneseEncodingDetectionTests.cpp)
+target_link_libraries(sakura_japanese_encoding_detection_tests PRIVATE sakura_app sakura_platform_mac)
+target_compile_features(sakura_japanese_encoding_detection_tests PRIVATE cxx_std_20)
+set_target_properties(sakura_japanese_encoding_detection_tests PROPERTIES CXX_EXTENSIONS OFF)
+add_test(NAME JapaneseEncodingDetectionTests COMMAND sakura_japanese_encoding_detection_tests)
+
 add_executable(sakura_grep_file_transaction_tests GrepFileTransactionTests.mm)
 target_link_libraries(sakura_grep_file_transaction_tests PRIVATE sakura_platform_mac)
 target_compile_features(sakura_grep_file_transaction_tests PRIVATE cxx_std_20)
@@ -29,7 +35,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "AppleClang|Clang")
 endif()
 add_test(NAME GrepFileTransactionTests COMMAND sakura_grep_file_transaction_tests)
 
-foreach(ui_test IN ITEMS EditorNavigation EditorSearch GrepWorkflow EditorSettings EditorRendering PublicationBranding)
+foreach(ui_test IN ITEMS EditorNavigation EditorSearch GrepWorkflow EditorSettings EditorRendering PublicationBranding RecoveryStore RecoveryWriter DurableFile EditorCommands FileWorkflow CoreFeatures SyntaxSettings KeywordFile SharedSearch AsyncHighlight AsyncNavigation BufferString AsyncReplacement AsyncSyntax AsyncHistory)
   string(TOLOWER "${ui_test}" ui_test_name)
   add_executable(sakura_${ui_test_name}_tests ${ui_test}Tests.mm)
   target_link_libraries(sakura_${ui_test_name}_tests PRIVATE sakura_ui_mac)
@@ -41,3 +47,13 @@ foreach(ui_test IN ITEMS EditorNavigation EditorSearch GrepWorkflow EditorSettin
     OBJCXX_STANDARD_REQUIRED ON)
   add_test(NAME ${ui_test}Tests COMMAND sakura_${ui_test_name}_tests)
 endforeach()
+
+add_executable(sakura_bracketnavigation_tests BracketNavigationTests.mm)
+target_link_libraries(sakura_bracketnavigation_tests PRIVATE sakura_ui_mac)
+target_compile_features(sakura_bracketnavigation_tests PRIVATE cxx_std_20)
+target_compile_options(sakura_bracketnavigation_tests PRIVATE -fobjc-arc)
+target_link_options(sakura_bracketnavigation_tests PRIVATE -Wl,-ObjC)
+set_target_properties(sakura_bracketnavigation_tests PROPERTIES
+  CXX_EXTENSIONS OFF OBJCXX_EXTENSIONS OFF OBJCXX_STANDARD 20
+  OBJCXX_STANDARD_REQUIRED ON)
+add_test(NAME BracketNavigationTests COMMAND sakura_bracketnavigation_tests)

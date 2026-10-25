@@ -55,11 +55,8 @@ TextEncodeResult unsupportedEncode(TextEncoding encoding) {
                      "encoding requires a platform codec adapter"}};
 }
 
-}  // namespace
-
-TextDecodeResult EncodingService::decode(std::span<const std::byte> data,
-                                         TextEncoding requestedEncoding) const {
-  const auto encoding = effectiveEncoding(requestedEncoding, data);
+TextDecodeResult decodeUsingEncoding(std::span<const std::byte> data,
+                                     TextEncoding encoding) {
   switch (encoding) {
     case TextEncoding::utf8:
       return makeDecodeResult(Utf8Codec::decode(data), encoding);
@@ -76,7 +73,20 @@ TextDecodeResult EncodingService::decode(std::span<const std::byte> data,
     case TextEncoding::automatic:
       break;
   }
-  return {};
+  return unsupportedDecode(encoding);
+}
+
+}  // namespace
+
+TextDecodeResult EncodingService::decode(std::span<const std::byte> data,
+                                         TextEncoding requestedEncoding) const {
+  auto result = decodeUsingEncoding(data, effectiveEncoding(requestedEncoding, data));
+  result.detection.method = result.state.hadBom
+      ? EncodingDetectionMethod::unicodeBom
+      : requestedEncoding != TextEncoding::automatic
+          ? EncodingDetectionMethod::explicitEncoding
+          : result.ok() ? EncodingDetectionMethod::validUtf8 : EncodingDetectionMethod::unspecified;
+  return result;
 }
 
 TextEncodeResult EncodingService::encode(SakuraStringView text,

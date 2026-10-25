@@ -4,8 +4,14 @@ add_library(sakura_portable_core STATIC
   src/encoding/Utf8Codec.cpp
   src/encoding/Utf16Codec.cpp
   src/layout/LayoutEngine.cpp
+  src/layout/IndexedLayout.cpp
   src/search/SearchEngine.cpp
+  src/search/BracketSearch.cpp
+  src/search/BufferUText.cpp
   src/syntax/SyntaxHighlighter.cpp
+  src/syntax/LanguageSyntax.cpp
+  src/syntax/IndexedSyntax.cpp
+  src/syntax/CustomSyntax.cpp
   src/text/TextBuffer.cpp
 )
 

@@ -150,6 +150,19 @@ static inline NSColor* SakuraKeywordText(NSAppearance* appearance) {
                                        : SakuraRGB(0, 0, 255);
 }
 
+static inline NSString* SakuraKeywordRole(NSUInteger group) {
+  return group <= 1 || group > 10 ? @"keyword" : [NSString stringWithFormat:@"keyword%lu", (unsigned long)group];
+}
+static inline NSColor* SakuraKeywordGroupText(NSUInteger group, NSAppearance* appearance) {
+  if (group <= 1 || group > 10) return SakuraKeywordText(appearance);
+  static const unsigned char light[9][3] = {{0,128,128},{128,0,128},{128,64,0},{160,0,0},
+      {192,0,128},{160,80,0},{0,96,160},{64,64,160},{96,112,0}};
+  static const unsigned char dark[9][3] = {{80,210,210},{210,150,255},{220,180,120},{255,140,140},
+      {255,140,210},{255,190,100},{120,200,255},{170,170,255},{200,220,120}};
+  const auto* color = SakuraThemeIsDark(appearance) ? dark[group - 2] : light[group - 2];
+  return SakuraRGB(color[0], color[1], color[2]);
+}
+
 static inline NSColor* SakuraNumberText(NSAppearance* appearance) {
   return SakuraThemeIsDark(appearance) ? SakuraRGB(255, 115, 115)
                                        : SakuraRGB(235, 0, 0);

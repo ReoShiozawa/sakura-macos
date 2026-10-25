@@ -28,10 +28,33 @@ struct EncodingState {
   friend constexpr bool operator==(const EncodingState&, const EncodingState&) = default;
 };
 
+// Read-time evidence, not a probability or a property of subsequently saved
+// bytes. A successful strict conversion does not prove that an inferred
+// encoding is what the author intended.
+enum class EncodingDetectionMethod {
+  unspecified,
+  explicitEncoding,
+  unicodeBom,
+  validUtf8,
+  iso2022Escape,
+  bytePattern,
+  japaneseHeuristic,
+  platformHeuristic,
+  fallback,
+};
+
+struct EncodingDetection {
+  EncodingDetectionMethod method{EncodingDetectionMethod::unspecified};
+  bool ambiguous{};  // More than one legacy byte interpretation is possible.
+
+  friend constexpr bool operator==(const EncodingDetection&, const EncodingDetection&) = default;
+};
+
 struct TextDecodeResult {
   SakuraString text;
   EncodingState state;
   std::optional<CodecError> error;
+  EncodingDetection detection{};
 
   [[nodiscard]] bool ok() const noexcept { return !error.has_value(); }
 };

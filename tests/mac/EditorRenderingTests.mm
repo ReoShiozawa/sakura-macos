@@ -8,17 +8,19 @@
 #include <chrono>
 #include <cmath>
 #include <iostream>
+#include <functional>
 #include <string_view>
 #include <vector>
 
 #import "SakuraDocument.h"
 #import "SakuraEditorView.h"
+#import "SakuraLayoutRows.h"
 #include "sakura/core/syntax/SyntaxHighlighter.h"
 #include "sakura/platform/mac/StringBridge.h"
 
 @interface SakuraEditorView (RenderingTestDiagnostics)
 - (NSDictionary<NSString*, NSNumber*>*)renderingStatistics;
-- (const std::vector<NSRange>&)displayLineRanges;
+- (const SakuraLayoutRows&)displayLineRanges;
 - (NSString*)displayString;
 - (NSRect)localRectForDisplayIndex:(NSUInteger)index;
 - (NSUInteger)displayIndexForLocalPoint:(NSPoint)point;
@@ -148,7 +150,12 @@ struct Fixture {
         colorSpaceName:NSDeviceRGBColorSpace bytesPerRow:0 bitsPerPixel:0];
   }
 
-  void draw(NSRect dirty = NSMakeRect(0, 0, 700, 160)) {
+  void draw(NSRect dirty = NSMakeRect(0, 0, 700, 160), bool settleSearch = true) {
+    (void)[view activeSearchRanges];
+    (void)[view activeSyntaxTokens];
+    NSDate* deadline = [NSDate dateWithTimeIntervalSinceNow:5];
+    while (settleSearch && ([[view renderingStatistics][@"searchPending"] boolValue] || view.hasPendingSyntax) && deadline.timeIntervalSinceNow > 0)
+      [NSRunLoop.currentRunLoop runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
     [NSGraphicsContext saveGraphicsState];
     NSGraphicsContext.currentContext =
         [NSGraphicsContext graphicsContextWithBitmapImageRep:bitmap];
@@ -374,8 +381,8 @@ void imeDisplayChangesDoNotReuseStaleTextOrGeometry() {
   EXPECT_STABLE(test, marked, fixture.statistics());
 }
 
-void expectSameLineRanges(const std::vector<NSRange>& actual,
-                         const std::vector<NSRange>& expected,
+void expectSameLineRanges(const SakuraLayoutRows& actual,
+                         const SakuraLayoutRows& expected,
                          std::string_view test) {
   EXPECT(test, actual.size() == expected.size());
   for (NSUInteger row = 0; row < std::min(actual.size(), expected.size()); ++row) {
@@ -460,10 +467,12 @@ void imeSelectionAndReplacementCacheDependencies() {
   [fixture.view setMarkedText:marked selectedRange:NSMakeRange(0, 0)
              replacementRange:NSMakeRange(4, 5)];
   fixture.draw();
-  EXPECT(test, [fixture.view activeSyntaxTokens].empty());
+  EXPECT(test, ![fixture.view activeSyntaxTokens].empty());
   EXPECT(test, [fixture.view activeSearchRanges].empty());
   Statistics warm = fixture.statistics();
   const auto revision = fixture.document.documentSession.buffer().revision();
+  EXPECT(test, count(warm, @"imeSharedBuilds") > 0);
+  EXPECT(test, count(warm, @"imeFullBuilds") == 0);
   for (NSUInteger offset : { 1U, 11U, 22U }) {
     // Equal contents, not object identity, determine the temporary text cache.
     NSMutableString* sameText = [marked mutableCopy];
@@ -473,6 +482,7 @@ void imeSelectionAndReplacementCacheDependencies() {
     EXPECT(test, NSEqualRanges(fixture.view.selectedRange,
                               NSMakeRange(4 + offset, 2)));
     EXPECT_STABLE(test, warm, fixture.statistics());
+    EXPECT(test, count(warm, @"imeSharedBuilds") == count(fixture.statistics(), @"imeSharedBuilds"));
   }
   EXPECT(test, fixture.document.documentSession.buffer().revision() == revision);
 
@@ -482,15 +492,30 @@ void imeSelectionAndReplacementCacheDependencies() {
   Statistics moved = fixture.statistics();
   EXPECT(test, count(moved, @"layoutBuilds") == count(warm, @"layoutBuilds") + 1);
   EXPECT(test, count(moved, @"textBuilds") == count(warm, @"textBuilds"));
-  EXPECT(test, count(moved, @"syntaxBuilds") == count(warm, @"syntaxBuilds"));
+  EXPECT(test, count(moved, @"syntaxBuilds") == count(warm, @"syntaxBuilds") + 1);
   EXPECT(test, count(moved, @"searchBuilds") == count(warm, @"searchBuilds"));
   EXPECT(test, [[fixture.view displayString] hasPrefix:marked]);
   EXPECT(test, NSEqualRanges(fixture.view.markedRange,
                             NSMakeRange(0, marked.length)));
-  EXPECT(test, [fixture.view activeSyntaxTokens].empty());
+  EXPECT(test, ![fixture.view activeSyntaxTokens].empty());
   EXPECT(test, [fixture.view activeSearchRanges].empty());
   fixture.draw();
   EXPECT_STABLE(test, moved, fixture.statistics());
+}
+
+void partialInputMethodRangesPreservePreviewFallback() {
+  constexpr std::string_view test="partialInputMethodRangesPreservePreviewFallback";
+  Preferences preferences;
+  for(NSUInteger offset : {2U,5U}) {
+    Fixture fixture(@"a😀b\r\nlast");
+    const auto original=fixture.document.documentSession.buffer().text();
+    const auto revision=fixture.document.documentSession.buffer().revision();
+    [fixture.view setMarkedText:@"X" selectedRange:NSMakeRange(0,0) replacementRange:NSMakeRange(offset,0)];
+    EXPECT(test, count(fixture.statistics(),@"imeFullBuilds")>0);
+    EXPECT(test, fixture.document.documentSession.buffer().text()==original);
+    [fixture.view cancelOperation:nil];
+    EXPECT(test, fixture.document.documentSession.buffer().text()==original && fixture.document.documentSession.buffer().revision()==revision);
+  }
 }
 
 void imeCancelEmptyUnmarkAndCommitPreserveTheDocument() {
@@ -503,7 +528,7 @@ void imeCancelEmptyUnmarkAndCommitPreserveTheDocument() {
   NSString* marked = @"桜\r\n葉\t0123456789abcdefghij";
   Fixture fixture(source);
   [fixture.view jumpToDocumentOffset:4];
-  const std::vector<NSRange> originalLines = [fixture.view displayLineRanges];
+  const SakuraLayoutRows originalLines = [fixture.view displayLineRanges];
   const auto revision = fixture.document.documentSession.buffer().revision();
   [fixture.view setMarkedText:marked selectedRange:NSMakeRange(marked.length, 0)
              replacementRange:NSMakeRange(4, 5)];
@@ -533,7 +558,7 @@ void imeCancelEmptyUnmarkAndCommitPreserveTheDocument() {
 
   [fixture.view setMarkedText:marked selectedRange:NSMakeRange(marked.length, 0)
              replacementRange:NSMakeRange(4, 5)];
-  const std::vector<NSRange> markedLines = [fixture.view displayLineRanges];
+  const SakuraLayoutRows markedLines = [fixture.view displayLineRanges];
   NSString* expected = [source stringByReplacingCharactersInRange:NSMakeRange(4, 5)
                                                       withString:marked];
   [fixture.view unmarkText];
@@ -687,7 +712,7 @@ void composedCharactersWrapAndHitTestAsWholeClusters() {
       Fixture fixture(source);
       [fixture.scroll setFrameSize:NSMakeSize(180, 160)];
       [fixture.view updateDocumentViewSize];
-      const std::vector<NSRange> rows = [fixture.view displayLineRanges];
+      const SakuraLayoutRows rows = [fixture.view displayLineRanges];
       const CGFloat origin = [fixture.view localRectForDisplayIndex:0].origin.x;
       const auto attributes = [fixture.view baseTextAttributes];
       const CGFloat available = mode.integerValue == 2
@@ -740,8 +765,10 @@ void benchmarkMillionLineDocument() {
   const auto started = Clock::now();
   Fixture fixture(text);
   const auto constructed = Clock::now();
-  fixture.draw();
+  fixture.draw(NSMakeRect(0,0,700,160),false);
   const auto firstDraw = Clock::now();
+  fixture.draw(); // Separate optional highlight settling from first-frame cost.
+  const auto searchReady = Clock::now();
   Statistics warm = fixture.statistics();
   constexpr NSUInteger redraws = 100;
   for (NSUInteger iteration = 0; iteration < redraws; ++iteration) fixture.draw();
@@ -759,12 +786,80 @@ void benchmarkMillionLineDocument() {
   std::cout << "Million-line rendering benchmark: construction/layout="
             << milliseconds(constructed - started)
             << " ms, first visible draw=" << milliseconds(firstDraw - constructed)
+            << " ms, highlight settle/redraw=" << milliseconds(searchReady - firstDraw)
             << " ms, " << redraws << " warm redraws="
-            << milliseconds(redrawn - firstDraw) << " ms, " << queries
+            << milliseconds(redrawn - searchReady) << " ms, " << queries
             << " tail lookups=" << milliseconds(queried - redrawn)
             << " ms, visible rows per redraw="
             << (count(after, @"drawnLines") - count(warm, @"drawnLines")) / redraws
             << '\n';
+}
+
+void localEditsAndImeKeepUnchangedLayoutBlocks() {
+  constexpr std::string_view test = "localEditsAndImeKeepUnchangedLayoutBlocks";
+  Preferences preferences;
+  preferences.set(@"SakuraTypeEditor.cpp.wrapMode", @0);
+  NSString* text = [@"" stringByPaddingToLength:20000 * 10 withString:@"int a=1;\n\n" startingAtIndex:0];
+  Fixture fixture(text);
+  const auto original = [fixture.view displayLineRanges];
+  Statistics before = fixture.statistics();
+  auto& session = fixture.document.documentSession;
+  const auto location = session.buffer().offsetAt({10000, 1});
+  session.replace({location, 1}, u"longer");
+  [fixture.view documentContentsDidChange];
+  Statistics changed = fixture.statistics();
+  EXPECT(test, count(changed, @"layoutMeasuredLines") == 1);
+  EXPECT(test, count(changed, @"layoutFullBuilds") == count(before, @"layoutFullBuilds"));
+  EXPECT(test, count(changed, @"layoutComparedTextNodes") < 300);
+  const auto changedRows = [fixture.view displayLineRanges];
+  EXPECT(test, changedRows.size() == original.size());
+  EXPECT(test, changedRows[10001].location == original[10001].location + 5);
+  // Both snapshots remain separately queryable, without a copied offset table.
+  EXPECT(test, original[10001].location == 50009);
+  session.replace({location, 0}, u"x\r\ny\n");
+  [fixture.view documentContentsDidChange];
+  EXPECT(test, count(fixture.statistics(), @"layoutMeasuredLines") <= 5);
+  EXPECT(test, count(fixture.statistics(), @"layoutFullBuilds") == count(before, @"layoutFullBuilds"));
+  const auto revision = session.buffer().revision();
+  [fixture.view setMarkedText:@"未確定" selectedRange:NSMakeRange(3, 0) replacementRange:NSMakeRange(location, 0)];
+  EXPECT(test, count(fixture.statistics(), @"layoutMeasuredLines") <= 5);
+  EXPECT(test, count(fixture.statistics(), @"layoutFullBuilds") == count(before, @"layoutFullBuilds"));
+  EXPECT(test, count(fixture.statistics(), @"imeSharedBuilds") > 0);
+  EXPECT(test, count(fixture.statistics(), @"imeFullBuilds") == 0);
+  EXPECT(test, session.buffer().revision() == revision);
+  EXPECT(test, [[fixture.view displayString] rangeOfString:@"未確定"].location == location);
+}
+
+void benchmarkMillionLineLayoutEdits() {
+  constexpr std::string_view test = "benchmarkMillionLineLayoutEdits";
+  using Clock = std::chrono::steady_clock;
+  const auto milliseconds = [](auto value) { return std::chrono::duration<double,std::milli>(value).count(); };
+  Preferences preferences;
+  constexpr NSUInteger rows = 1000000;
+  NSString* text = [@"" stringByPaddingToLength:rows * 2 withString:@"x\n" startingAtIndex:0];
+  const auto started = Clock::now();
+  Fixture fixture(text);
+  const auto cold = Clock::now();
+  const auto location = fixture.document.documentSession.buffer().offsetAt({500000, 1});
+  fixture.document.documentSession.insert(location, u"あ");
+  const auto editStarted = Clock::now();
+  [fixture.view documentContentsDidChange];
+  const auto edited = Clock::now();
+  const auto editStats = fixture.statistics();
+  EXPECT(test, count(editStats, @"layoutMeasuredLines") == 1);
+  const auto length = [fixture.view displayString].length;
+  const auto rect = [fixture.view localRectForDisplayIndex:length - 3];
+  (void)[fixture.view displayIndexForLocalPoint:NSMakePoint(rect.origin.x, rect.origin.y + 1)];
+  const auto hitTested = Clock::now();
+  [fixture.view setMarkedText:@"未確定" selectedRange:NSMakeRange(3, 0) replacementRange:NSMakeRange(location, 0)];
+  const auto marked = Clock::now();
+  EXPECT(test, count(fixture.statistics(), @"layoutMeasuredLines") == 1);
+  EXPECT(test, count(fixture.statistics(), @"imeFullBuilds") == 0);
+  std::cout << "Million-line indexed layout: UTF16Units=" << length << " lines=" << rows + 1
+      << " cold_ms=" << milliseconds(cold-started) << " edit_view_update_ms=" << milliseconds(edited-editStarted)
+      << " tail_rect_hit_ms=" << milliseconds(hitTested-edited) << " IME_view_update_ms=" << milliseconds(marked-hitTested)
+      << " measuredLines=" << count(editStats,@"layoutMeasuredLines")
+      << " comparedTextNodes=" << count(editStats,@"layoutComparedTextNodes") << '\n';
 }
 
 }  // namespace
@@ -775,6 +870,8 @@ int main(int argc, const char* argv[]) {
     [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
     if (argc == 2 && std::string_view(argv[1]) == "--benchmark") {
       benchmarkMillionLineDocument();
+    } else if (argc == 2 && std::string_view(argv[1]) == "--benchmark-layout-edit") {
+      benchmarkMillionLineLayoutEdits();
     } else {
       unchangedDocumentAndSelectionReuseRenderingWork();
       editsInvalidateTextAnalysisAndSearchOnce();
@@ -786,10 +883,12 @@ int main(int argc, const char* argv[]) {
       imeDisplayChangesDoNotReuseStaleTextOrGeometry();
       imeUsesCommittedWrapTabAndFontGeometry();
       imeSelectionAndReplacementCacheDependencies();
+      partialInputMethodRangesPreservePreviewFallback();
       imeCancelEmptyUnmarkAndCommitPreserveTheDocument();
       imeCandidateRectAndHitTestingUseWrappedDisplayRows();
       warmLargeDocumentLookupsAreLogarithmic();
       composedCharactersWrapAndHitTestAsWholeClusters();
+      localEditsAndImeKeepUnchangedLayoutBlocks();
     }
   }
   if (failures != 0) {

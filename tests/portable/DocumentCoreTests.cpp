@@ -1174,6 +1174,50 @@ void encodingMetadataParticipatesInDirtyState() {
   EXPECT(test, document.isDirty());
 }
 
+void saveCompletionPreservesNewEncodingChoices() {
+  constexpr std::string_view test = "saveCompletionPreservesNewEncodingChoices";
+  for (const auto policy : {BomPolicy::preserve, BomPolicy::always, BomPolicy::never}) {
+    DocumentSession document;
+    EXPECT(test, document.load(bytes({'x'})).ok());
+    document.insert(1, u"!");
+    const auto old = document.makeSaveSnapshot(policy);
+    const EncodingState chosen{TextEncoding::utf16BigEndian, true};
+    document.setEncodingState(chosen);
+    document.markSaved(old.token);
+    EXPECT(test, document.encodingState() == chosen);
+    EXPECT(test, document.isDirty());
+    const auto next = document.makeSaveSnapshot();
+    EXPECT(test, next.encoded.ok());
+    EXPECT(test, next.token.encodingState == chosen);
+    document.markSaved(next.token);
+    EXPECT(test, !document.isDirty());
+    EXPECT(test, document.encodingState() == chosen);
+  }
+  // A newer explicit choice remains authoritative even after returning to the
+  // original value; equality alone cannot authenticate an old BOM policy.
+  DocumentSession document;
+  EXPECT(test, document.load(bytes({'x'})).ok());
+  const auto withBom = document.makeSaveSnapshot(BomPolicy::always);
+  document.setEncodingState({TextEncoding::utf16LittleEndian, true});
+  document.setEncodingState({TextEncoding::utf8, false});
+  document.markSaved(withBom.token);
+  EXPECT(test, document.encodingState() == (EncodingState{TextEncoding::utf8, false}));
+  EXPECT(test, document.isDirty());
+}
+
+void unrelatedMetadataDoesNotDiscardSuccessfulBomPolicy() {
+  constexpr std::string_view test = "unrelatedMetadataDoesNotDiscardSuccessfulBomPolicy";
+  DocumentSession document;
+  EXPECT(test, document.load(bytes({'x'})).ok());
+  const auto withBom = document.makeSaveSnapshot(BomPolicy::always);
+  document.markMetadataChanged(); // E.g. a preferred newline change.
+  document.markSaved(withBom.token);
+  EXPECT(test, document.encodingState() == (EncodingState{TextEncoding::utf8, true}));
+  EXPECT(test, document.isDirty());
+  document.markSaved(document.makeSaveSnapshot().token);
+  EXPECT(test, !document.isDirty());
+}
+
 void documentSessionBatchesRectangularEdits() {
   constexpr std::string_view test = "documentSessionBatchesRectangularEdits";
   DocumentSession document;
@@ -1268,6 +1312,8 @@ int main() {
   saveTokensAreNotReusedAfterLoad();
   successfulSaveUpdatesTheBomState();
   encodingMetadataParticipatesInDirtyState();
+  saveCompletionPreservesNewEncodingChoices();
+  unrelatedMetadataDoesNotDiscardSuccessfulBomPolicy();
   documentSessionBatchesRectangularEdits();
   commandBusDispatchesStableFunctionCodes();
   documentOwnershipCannotBeAliased();

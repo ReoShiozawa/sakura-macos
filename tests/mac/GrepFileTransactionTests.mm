@@ -246,6 +246,28 @@ void supportsExplicitlyDisabledBackups() {
   EXPECT(test, read(path) == "changed");
   EXPECT(test, entries(directory.path) == 1);
 }
+void reportsSynchronizationFailuresAtTheirCommitBoundary() {
+  constexpr auto test = "reportsSynchronizationFailuresAtTheirCommitBoundary";
+  for (auto stage : {GrepSyncStage::fileBeforeRename, GrepSyncStage::directoryAfterRename, GrepSyncStage::fileAfterRename}) {
+    TemporaryDirectory directory;
+    const auto path = directory.path / "document.txt";
+    write(path, "original");
+    auto preview = readGrepFileSnapshot(path);
+    if (!preview.snapshot) { EXPECT(test, false); continue; }
+    GrepCommitOptions options;
+    options.beforeSync = [stage](GrepSyncStage current) { return current != stage; };
+    const auto result = commitGrepReplacement(*preview.snapshot, bytes("changed"), options);
+    const bool committed = stage != GrepSyncStage::fileBeforeRename;
+    EXPECT(test, result.status == (committed ? GrepCommitStatus::writtenNotDurable : GrepCommitStatus::error));
+    EXPECT(test, !result.error.empty());
+    EXPECT(test, read(path) == (committed ? "changed" : "original"));
+    EXPECT(test, entries(directory.path) == (committed ? 2 : 1));
+    if (committed) {
+      EXPECT(test, read(result.backupPath) == "original");
+      EXPECT(test, result.error.find("applied") != std::string::npos);
+    }
+  }
+}
 }  // namespace
 
 int main() {
@@ -257,6 +279,7 @@ int main() {
   limitsSnapshotsAndRecognizesNumberedBackups();
   refusesReadOnlyReplacementWithoutCreatingArtifacts();
   supportsExplicitlyDisabledBackups();
+  reportsSynchronizationFailuresAtTheirCommitBoundary();
   if (failures) {
     std::cerr << failures << " Grep transaction assertion(s) failed\n";
     return 1;

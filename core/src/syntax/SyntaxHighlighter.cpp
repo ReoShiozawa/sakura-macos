@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Zlib
 
 #include "sakura/core/syntax/SyntaxHighlighter.h"
+#include "SyntaxScan.h"
 
 #include <array>
 #include <algorithm>
@@ -45,8 +46,10 @@ void append(std::vector<SyntaxToken>& tokens, std::size_t start,
 }  // namespace
 
 std::vector<SyntaxToken> SyntaxHighlighter::highlightCLike(
-    const TextBuffer& buffer) const {
-  const SakuraString text = buffer.text();
+    const TextBuffer& buffer, const std::function<bool()>& cancelled) const {
+  detail::SyntaxProbe probe(cancelled);
+  const SakuraString source = buffer.text(cancelled);
+  const detail::SyntaxText text(source, probe);
   std::vector<SyntaxToken> tokens;
   tokens.reserve(text.size() / 10);
 
@@ -123,13 +126,14 @@ std::vector<SyntaxToken> SyntaxHighlighter::highlightCLike(
       while (index < text.size() && isIdentifierContinue(text[index])) {
         ++index;
       }
-      if (isKeyword(SakuraStringView(text).substr(start, index - start))) {
+      if (isKeyword(text.substr(start, index - start))) {
         append(tokens, start, index, SyntaxTokenKind::keyword);
       }
       continue;
     }
     ++index;
   }
+  probe.check();
   return tokens;
 }
 

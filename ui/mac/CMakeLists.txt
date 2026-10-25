@@ -5,8 +5,15 @@ find_library(COREGRAPHICS_FRAMEWORK CoreGraphics REQUIRED)
 add_library(sakura_ui_mac STATIC
   src/SakuraAppDelegate.mm
   src/SakuraDocument.mm
+  src/SakuraDurableFile.mm
+  src/SakuraRecoveryStore.mm
+  src/SakuraRecoveryWriter.mm
   src/SakuraEditorView.mm
+  src/SakuraEditorCommands.mm
   src/SakuraEditorSettings.mm
+  src/SakuraSyntaxSettings.mm
+  src/SakuraSearchState.mm
+  src/SakuraKeywordFile.mm
   src/SakuraWindowController.mm
 )
 

@@ -28,7 +28,12 @@
 #endif
 
 - (void)noteEditorChange:(NSDocumentChangeType)changeType;
+- (void)saveAndClose:(id)sender;
+- (void)commitPendingInput;
 - (void)refreshEditorViews;
+- (NSIndexSet*)bookmarkLines;
+- (void)toggleBookmarkAtLine:(NSUInteger)line;
+- (void)clearBookmarks;
 - (NSString*)preferredLineEndingString;
 - (NSString*)newlineInsertionString;
 - (void)setPreferredLineEndingString:(NSString*)lineEnding;

@@ -36,6 +36,11 @@ configuration. Menu ordering, default colors and behavior draw on the upstream
 implementation and resources, notably MainMenu.ini, Japanese resources and
 ColorInfo_DEFAULT. These are derivative adaptations, not a claim to have independently
 invented the upstream design. New headers do not remove underlying upstream rights.
+The CP932/EUC-JP byte-evidence tie breaker in platform/mac/src/MacEncodingService.mm
+is an altered adaptation of CESI::GuessEucOrSjis and charset/codechecker.h
+(Copyright (C) 2006, 2007, 2018-2022, Sakura Editor Organization; zlib).
+The macOS adapter adds SS2 half-kana evidence, a bounded Foundation hint and
+read-time ambiguity reporting; it is not the original Windows detector.
 
 ## Separate materials
 

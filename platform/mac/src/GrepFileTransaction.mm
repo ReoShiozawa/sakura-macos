@@ -224,6 +224,12 @@ GrepCommitResult commitGrepReplacement(const GrepFileSnapshot& snapshot,
                                       const GrepCommitOptions& options) {
   const auto cancelled = [&] { return options.cancelled && options.cancelled(); };
   const auto permitted = [&] { return !options.beforeCommit || options.beforeCommit(); };
+  const auto syncFile = [&](int fd, GrepSyncStage stage) {
+    if (options.beforeSync && !options.beforeSync(stage)) { errno = EIO; return false; }
+    int result;
+    do { result = ::fcntl(fd, F_FULLFSYNC); } while (result < 0 && errno == EINTR);
+    return result == 0;
+  };
   if (cancelled()) return stopped(GrepCommitStatus::cancelled);
   const auto filename = snapshot.path.filename().string();
   if (!snapshot.path.is_absolute() || !validFilename(filename))
@@ -262,6 +268,8 @@ GrepCommitResult commitGrepReplacement(const GrepFileSnapshot& snapshot,
     return stopped(GrepCommitStatus::error, std::move(error));
   if (!preserveSecurityMetadata(original.get(), temporary.get(), snapshot.identity.mode, error))
     return stopped(GrepCommitStatus::error, std::move(error));
+  if (!syncFile(temporary.get(), GrepSyncStage::fileBeforeRename))
+    return stopped(GrepCommitStatus::error, systemError("full sync staged file"));
   if (options.afterStaging) options.afterStaging();
   if (cancelled()) return stopped(GrepCommitStatus::cancelled);
   if (!permitted()) return stopped(cancelled() ? GrepCommitStatus::cancelled :
@@ -285,6 +293,8 @@ GrepCommitResult commitGrepReplacement(const GrepFileSnapshot& snapshot,
         return stopped(GrepCommitStatus::error, std::move(error));
       if (!preserveSecurityMetadata(original.get(), backup.get(), snapshot.identity.mode, error))
         return stopped(GrepCommitStatus::error, std::move(error));
+      if (!syncFile(backup.get(), GrepSyncStage::fileBeforeRename))
+        return stopped(GrepCommitStatus::error, systemError("full sync backup"));
       break;
     }
     if (staged.backup.empty())
@@ -303,9 +313,17 @@ GrepCommitResult commitGrepReplacement(const GrepFileSnapshot& snapshot,
   const auto backupPath = staged.backup.empty() ? std::filesystem::path{} :
       snapshot.path.parent_path() / staged.backup;
   staged.backup.clear();
-  // The rename succeeded even if a directory fsync is unsupported; reporting a
-  // failure after this point would misleadingly imply that the original survived.
-  ::fsync(directory.get());
+  // A rename is already committed: never report it as an unchanged/error-only
+  // file if metadata/device flushing fails. Keep the backup and stop the batch.
+  bool synced = !options.beforeSync || options.beforeSync(GrepSyncStage::directoryAfterRename);
+  if (synced) {
+    int result;
+    do { result = ::fsync(directory.get()); } while (result < 0 && errno == EINTR);
+    synced = result == 0;
+  } else errno = EIO;
+  if (!synced || !syncFile(temporary.get(), GrepSyncStage::fileAfterRename))
+    return {GrepCommitStatus::writtenNotDurable, backupPath,
+        systemError("Replacement is applied, but disk synchronization failed; retain/check the backup")};
   return {GrepCommitStatus::written, backupPath, {}};
 }
 

@@ -41,7 +41,8 @@ struct GrepSnapshotResult {
   std::string error;
 };
 
-enum class GrepCommitStatus { written, conflict, cancelled, error };
+enum class GrepCommitStatus { written, writtenNotDurable, conflict, cancelled, error };
+enum class GrepSyncStage { fileBeforeRename, directoryAfterRename, fileAfterRename };
 
 struct GrepCommitOptions {
   bool createBackup = true;
@@ -51,6 +52,8 @@ struct GrepCommitOptions {
   std::function<bool()> beforeCommit;
   // Deterministic race simulation for integration tests; normally left empty.
   std::function<void()> afterStaging;
+  // Fault gate for deterministic synchronization-failure tests.
+  std::function<bool(GrepSyncStage)> beforeSync;
 };
 
 struct GrepCommitResult {

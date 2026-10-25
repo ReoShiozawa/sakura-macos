@@ -7,6 +7,7 @@
 
 #import "SakuraDocument.h"
 #import "SakuraEditorView.h"
+#import "SearchTestSupport.h"
 #include "sakura/platform/mac/StringBridge.h"
 
 @interface SakuraEditorView (SearchTests)
@@ -57,6 +58,7 @@ struct Fixture {
   }
 
   void selection(NSUInteger location, NSUInteger length, const char* message) {
+    expect(SakuraWaitForSearchNavigation(view), "async search reached terminal state");
     expect(NSEqualRanges(view.selectedRange, NSMakeRange(location, length)), message);
   }
 };
@@ -88,6 +90,7 @@ void singleReplaceRetainsRegexFlagsAndCaptures() {
   [fixture.view findNext:nil];
   fixture.selection(0, 1, "lookahead selected before replace");
   [fixture.view replaceSearchSelection:nil];
+  expect(SakuraWaitForReplacement(fixture.view), "single replacement reaches terminal state");
   expect(fixture.document.documentSession.buffer().text() == u"[b]b ab",
          "single replace uses lookahead capture from original context");
   fixture.selection(5, 1, "single replace selects next regex match");
@@ -101,7 +104,9 @@ void singleReplaceRetainsRegexFlagsAndCaptures() {
   insensitive.find.stringValue = @"(桜a)";
   insensitive.replacement.stringValue = @"<$1>";
   [insensitive.view findNext:nil];
+  expect(SakuraWaitForSearchNavigation(insensitive.view), "case-insensitive search completed before replace");
   [insensitive.view replaceSearchSelection:nil];
+  expect(SakuraWaitForReplacement(insensitive.view), "case-insensitive replacement reaches terminal state");
   expect(insensitive.document.documentSession.buffer().text() == u"<桜A>",
          "single replace preserves Unicode case-insensitive regex option");
 }
@@ -111,11 +116,14 @@ void zeroWidthReplaceDoesNotReselectTheSameOriginalCharacter() {
   fixture.find.stringValue = @"(?=a)|$";
   fixture.replacement.stringValue = @"X";
   [fixture.view findNext:nil];
+  expect(SakuraWaitForSearchNavigation(fixture.view), "zero-width search completed before replace");
   [fixture.view replaceSearchSelection:nil];
+  expect(SakuraWaitForReplacement(fixture.view), "first zero-width replacement reaches terminal state");
   expect(fixture.document.documentSession.buffer().text() == u"Xaa",
          "zero width insertion preserves source character");
   fixture.selection(2, 0, "zero width replace advances beyond original character");
   [fixture.view replaceSearchSelection:nil];
+  expect(SakuraWaitForReplacement(fixture.view), "second zero-width replacement reaches terminal state");
   expect(fixture.document.documentSession.buffer().text() == u"XaXa",
          "second zero width replacement targets next original character");
   fixture.selection(4, 0, "zero width replace progresses to document end");

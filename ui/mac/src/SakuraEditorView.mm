@@ -7,19 +7,30 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
+#include <deque>
 #include <exception>
 #include <limits>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 #import "SakuraDocument.h"
 #import "SakuraColorTheme.h"
 #import "SakuraEditorSettings.h"
+#import "SakuraSyntaxSettings.h"
+#import "SakuraSearchState.h"
+#import "SakuraLayoutRows.h"
 #import "SakuraWindowController.h"
 #include "sakura/core/layout/LayoutEngine.h"
 #include "sakura/core/syntax/SyntaxHighlighter.h"
+#include "sakura/core/syntax/IndexedSyntax.h"
 #include "sakura/platform/mac/CoreTextMetrics.h"
 #include "sakura/platform/mac/StringBridge.h"
+
+@interface SakuraDocument (HistoryNavigationInternals)
+- (BOOL)closingDocument;
+@end
 
 namespace {
 
@@ -29,6 +40,63 @@ constexpr CGFloat kGutterWidth = 48.0;
 constexpr CGFloat kTextOriginX = kGutterWidth + kHorizontalInset;
 constexpr CGFloat kMinimumContentWidth = 320.0;
 constexpr CGFloat kMinimumContentHeight = 200.0;
+dispatch_queue_t replacementPreparationQueue() {
+  static dispatch_queue_t queue;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    queue = dispatch_queue_create("local.unofficial-sakura.replacement-preparation",
+        dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0));
+  });
+  return queue;
+}
+dispatch_queue_t syntaxPreparationQueue() {
+  static dispatch_queue_t queue;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    queue = dispatch_queue_create("local.unofficial-sakura.syntax-preparation",
+        dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0));
+  });
+  return queue;
+}
+using SyntaxTokens = std::vector<sakura::core::SyntaxToken>;
+using SharedSyntaxTokens = std::shared_ptr<const SyntaxTokens>;
+using SharedSyntaxIndex = std::shared_ptr<const sakura::core::IndexedSyntax>;
+SharedSyntaxTokens emptySyntaxTokens() {
+  static const auto empty = std::make_shared<const SyntaxTokens>();
+  return empty;
+}
+struct SyntaxWork {
+  std::shared_ptr<const sakura::core::TextBuffer> source;
+  sakura::core::TextBuffer display;
+  SharedSyntaxIndex previous, base, retiredIndex;
+  SharedSyntaxTokens additional, retiredDiagnostic, retiredAdditional;
+};
+struct RetiredSyntax {
+  SharedSyntaxTokens diagnostic, additional;
+  SharedSyntaxIndex index;
+  std::shared_ptr<const sakura::core::TextBuffer> source;
+};
+struct SearchNavigationRequest {
+  BOOL previous;
+  NSUInteger explicitStart; // NSNotFound means start from the latest selection.
+};
+struct ReplacementViewLayout {
+  __weak SakuraEditorView* view;
+  NSArray* key;
+  std::string fontName;
+  float pointSize, characterSpacing;
+  SakuraEditorWrapMode wrapMode;
+  NSInteger wrapColumn, tabWidth;
+  CGFloat viewportWidth;
+  std::uint64_t metricsRevision;
+  sakura::core::IndexedLayout layout, retired;
+};
+
+NSArray* layoutConfigurationKey(SakuraEditorSettings* settings, NSFont* font, NSSize viewport) {
+  return @[font.fontName, @(font.pointSize), @(settings.characterSpacing),
+      @(settings.tabWidth), @(settings.wrapMode), @(settings.wrapColumn),
+      @(settings.wrapMode == SakuraEditorWrapModeWindow ? viewport.width : 0.0)];
+}
 
 NSRange clampedRange(NSRange range, NSUInteger length) {
   if (range.location == NSNotFound) {
@@ -50,19 +118,14 @@ NSString* plainString(id value) {
   return description != nil ? description : @"";
 }
 
-NSUInteger lineIndexContainingCharacter(const std::vector<NSRange>& ranges,
+NSUInteger lineIndexContainingCharacter(const SakuraLayoutRows& ranges,
                                         NSUInteger index,
                                         NSUInteger* steps) {
   if (ranges.empty()) return 0;
-  auto found = std::lower_bound(ranges.begin(), ranges.end(), index,
-      [steps](NSRange range, NSUInteger position) {
-        if (steps != nullptr) ++*steps;
-        return NSMaxRange(range) < position;
-      });
-  if (found == ranges.end()) return ranges.size() - 1;
-  // Newline code units belong to the preceding row, as does a soft-wrap end.
-  if (found->location > index && found != ranges.begin()) --found;
-  return static_cast<NSUInteger>(found - ranges.begin());
+  std::size_t visited = 0;
+  const auto row = ranges.index.visualLineForOffset(index, &visited);
+  if (steps) *steps += visited;
+  return row;
 }
 
 CGFloat offsetForIndex(CTLineRef line, NSUInteger index) {
@@ -75,11 +138,11 @@ CGFloat offsetForIndex(CTLineRef line, NSUInteger index) {
                                        &secondary);
 }
 
-NSString* syntaxRole(sakura::core::SyntaxTokenKind kind) {
-  switch (kind) {
+NSString* syntaxRole(const sakura::core::SyntaxToken& token) {
+  switch (token.kind) {
     case sakura::core::SyntaxTokenKind::comment: return @"comment";
     case sakura::core::SyntaxTokenKind::string: return @"string";
-    case sakura::core::SyntaxTokenKind::keyword: return @"keyword";
+    case sakura::core::SyntaxTokenKind::keyword: return SakuraKeywordRole(token.keywordGroup);
     case sakura::core::SyntaxTokenKind::number: return @"number";
     case sakura::core::SyntaxTokenKind::preprocessor: return @"preprocessor";
   }
@@ -110,6 +173,26 @@ NSString* syntaxRole(sakura::core::SyntaxTokenKind kind) {
 @property(nonatomic, strong, nullable) NSButton* caseSensitiveButton;
 @property(nonatomic, strong, nullable) NSButton* wholeWordButton;
 @property(nonatomic, strong, nullable) NSButton* regularExpressionButton;
+@property(nonatomic, strong) NSButton* searchWrapButton;
+@property(nonatomic, strong) NSButton* searchScopeButton;
+@property(nonatomic, strong) NSTextField* searchScopeLabel;
+@property(nonatomic, strong) NSPopUpButton* replacementHistoryPopup;
+@property(nonatomic) NSRange searchScopeRange;
+@property(nonatomic) uint64_t searchScopeRevision;
+@property(nonatomic) BOOL searchScopeCaptured;
+@property(nonatomic, strong) NSProgress* searchCountProgress;
+@property(nonatomic, strong) NSProgress* replacementProgress;
+@property(nonatomic, strong) NSProgress* historyProgress;
+@property(nonatomic) BOOL applyingHistoryTransition;
+@property(nonatomic) BOOL historyWindowClosed;
+@property(nonatomic) uint64_t searchCountRevision;
+@property(nonatomic, strong) NSProgress* searchHighlightProgress;
+@property(nonatomic, copy) NSString* searchHighlightStatusText;
+@property(nonatomic, copy) NSString* searchOperationStatusText;
+@property(nonatomic, strong) NSProgress* searchNavigationProgress;
+@property(nonatomic, copy) NSArray* searchNavigationContextKey;
+@property(nonatomic) uint64_t selectionGeneration;
+@property(nonatomic) BOOL applyingSearchNavigation;
 @property(nonatomic, strong, nullable) NSTextField* findStatusLabel;
 @property(nonatomic) BOOL searchMarksHidden;
 @property(nonatomic) BOOL hasLastSearchMatch;
@@ -117,34 +200,154 @@ NSString* syntaxRole(sakura::core::SyntaxTokenKind kind) {
 @property(nonatomic) std::uint64_t lastSearchRevision;
 @property(nonatomic, copy, nullable) NSString* lastSearchPattern;
 @property(nonatomic) NSUInteger lastSearchFlags;
+@property(nonatomic) uint64_t lastSearchSelectionGeneration;
+@property(nonatomic, strong) NSProgress* syntaxProgress;
+@property(nonatomic, copy) NSString* syntaxStatusText;
+@property(nonatomic, copy) NSString* customSyntaxStatusText;
+- (NSArray*)currentSyntaxKey;
+- (void)invalidateOutdatedSyntax;
+- (void)prepareSyntax;
+- (SyntaxTokens)syntaxTokensInRange:(NSRange)range;
+- (void)cancelSearchNavigation;
+- (void)cancelPreparedReplacement;
+- (void)prepareSearchReplacementAll:(BOOL)all;
+- (NSArray*)layoutConfigurationKey;
+- (NSArray<SakuraEditorView*>*)replacementAffectedViews;
+- (ReplacementViewLayout)captureReplacementLayout;
+- (void)adoptReplacementLayout:(ReplacementViewLayout&)work;
+- (void)adoptPreparedLayout:(ReplacementViewLayout&)work;
+- (void)enqueueHistoryDirection:(sakura::core::EditEngine::HistoryDirection)direction;
+- (void)startNextHistoryNavigation;
+- (void)updateCommittedSelection:(NSRange)selection preservingHistory:(BOOL)preservingHistory;
+- (std::function<void()>)historyWorkGate;
+- (NSTimeInterval)historyPreparationTimeLimit;
+- (void)startNextSearchNavigation;
+- (NSArray*)navigationSearchKey;
 @end
 
 @implementation SakuraEditorView {
   NSString* _cachedCommittedString;
+  sakura::core::TextBuffer _cachedCommittedBuffer;
   std::uint64_t _cachedTextRevision;
   NSString* _cachedDisplayString;
+  NSObject* _cachedCompositionIdentity;
   NSString* _cachedMarkedString;
   NSRange _cachedMarkedReplacement;
   NSString* _layoutDisplayString;
   NSArray* _layoutKey;
-  std::vector<NSRange> _cachedLineRanges;
-  std::vector<std::size_t> _cachedLogicalLines;
+  SakuraLayoutRows _cachedLineRanges;
+  std::uint64_t _layoutMetricsRevision;
+  NSUInteger _layoutMeasuredLines, _layoutFullBuilds, _layoutComparedTextNodes;
   std::unique_ptr<sakura::core::TextBuffer> _markedLayoutBuffer;
   NSString* _markedLayoutString;
   CGFloat _cachedWidestLine;
   NSArray* _syntaxKey;
-  std::vector<sakura::core::SyntaxToken> _cachedSyntaxTokens;
+  SharedSyntaxTokens _cachedSyntaxTokens;
+  SharedSyntaxTokens _additionalSyntaxTokens;
+  SharedSyntaxIndex _cachedSyntaxIndex, _previousSyntaxIndex;
+  BOOL _flattenedSyntaxReady;
+  NSUInteger _syntaxFlattenBuilds;
+  sakura::core::SyntaxUpdateStatistics _syntaxUpdate;
+  std::shared_ptr<const sakura::core::TextBuffer> _syntaxSource;
+  NSUInteger _syntaxCompletions, _syntaxDiscards;
+  BOOL _syntaxWorkerRanOnMainThread;
   NSArray* _searchKey;
   std::vector<NSRange> _cachedSearchRanges;
   NSArray* _styleKey;
   NSCache<NSNumber*, NSAttributedString*>* _styledLines;
   NSUInteger _textBuilds, _layoutBuilds, _syntaxBuilds, _searchBuilds;
   NSUInteger _styledBuilds, _drawnLines, _lineLookupSteps;
+  NSUInteger _searchCompletions, _searchDiscards;
+  BOOL _searchWorkerRanOnMainThread;
+  NSUInteger _imeSharedBuilds, _imeFullBuilds;
+  std::deque<SearchNavigationRequest> _searchNavigationRequests;
+  NSUInteger _navigationCompletions, _navigationDiscards;
+  BOOL _navigationWorkerRanOnMainThread;
+  NSUInteger _replacementCompletions, _replacementDiscards;
+  BOOL _replacementWorkerRanOnMainThread;
+  NSUInteger _replacementLayoutsAdopted;
+  double _replacementMainMilliseconds, _replacementAdoptMilliseconds, _replacementRefreshMilliseconds;
+  std::deque<sakura::core::EditEngine::HistoryDirection> _historyRequests;
+  NSUInteger _historyCompletions, _historyDiscards, _historyLayoutsAdopted;
+  uint64_t _historyCancellationGeneration;
+  BOOL _historyWorkerRanOnMainThread;
+  double _historyMainMilliseconds, _historyAdoptMilliseconds, _historyRefreshMilliseconds;
 }
 
 @synthesize committedSelection = _committedSelection;
 
+- (void)dealloc {
+  [self cancelBracketSearch];
+  self.findPanel.delegate = nil;
+  [self.syntaxProgress cancel];
+  [self.searchCountProgress cancel];
+  [self.replacementProgress cancel];
+  [self.searchHighlightProgress cancel];
+  [self.searchNavigationProgress cancel];
+  [self.historyProgress cancel];
+  [NSNotificationCenter.defaultCenter removeObserver:self name:NSWindowWillCloseNotification object:nil];
+  [NSNotificationCenter.defaultCenter removeObserver:self name:SakuraSearchStateDidChangeNotification object:nil];
+}
+- (NSString*)customSyntaxStatus { return self.customSyntaxStatusText != nil ? self.customSyntaxStatusText : @""; }
+- (NSString*)syntaxStatus { return self.syntaxStatusText != nil ? self.syntaxStatusText : @""; }
+- (BOOL)hasPendingSyntax { return self.syntaxProgress != nil; }
+- (void)cancelSyntaxHighlighting:(id)sender {
+  (void)sender;
+  if (self.syntaxProgress == nil) return;
+  [self.syntaxProgress cancel]; self.syntaxProgress = nil;
+  [self setCustomSyntaxStatusMessage:@""];
+  [self setSyntaxStatusMessage:@"色分けを中止しました（編集で再解析）。"];
+}
+- (NSString*)searchHighlightStatus { return self.searchHighlightStatusText != nil ? self.searchHighlightStatusText : @""; }
+- (NSString*)searchOperationStatus { return self.searchOperationStatusText != nil ? self.searchOperationStatusText : @""; }
+- (void)cancelSearchHighlights {
+  [self.searchHighlightProgress cancel]; self.searchHighlightProgress = nil;
+  _searchKey = nil; _cachedSearchRanges.clear(); [_styledLines removeAllObjects];
+  self.searchHighlightStatusText = @"";
+}
+- (void)setSearchHighlightStatusMessage:(NSString*)message {
+  self.searchHighlightStatusText = message;
+  if ([self.window.windowController isKindOfClass:SakuraWindowController.class]) {
+    SakuraWindowController* controller = (SakuraWindowController*)self.window.windowController;
+    NSResponder* responder = self.window.firstResponder;
+    if ([responder isKindOfClass:SakuraEditorView.class] ? responder == self : controller.editorView == self)
+      [controller updateStatusForEditor:self];
+  }
+}
+- (NSDictionary*)syntaxPreferences {
+  return SakuraSyntaxPreferences(SakuraTypeIdentifierForExtension(self.sakuraDocument.fileURL.pathExtension),
+                                 NSUserDefaults.standardUserDefaults);
+}
+- (void)setCustomSyntaxStatusMessage:(NSString*)message {
+  self.customSyntaxStatusText = message;
+  if ([self.window.windowController isKindOfClass:SakuraWindowController.class]) {
+    SakuraWindowController* controller = (SakuraWindowController*)self.window.windowController;
+    NSResponder* responder = self.window.firstResponder;
+    if ([responder isKindOfClass:SakuraEditorView.class] ? responder == self : controller.editorView == self)
+      [controller updateStatusForEditor:self];
+  }
+}
+- (void)setSyntaxStatusMessage:(NSString*)message {
+  self.syntaxStatusText = message;
+  // Both statuses use the same status-bar refresh route.
+  [self setCustomSyntaxStatusMessage:self.customSyntaxStatus];
+}
+
 - (void)setCommittedSelection:(NSRange)selection {
+  [self updateCommittedSelection:selection preservingHistory:NO];
+}
+
+- (void)updateCommittedSelection:(NSRange)selection preservingHistory:(BOOL)preservingHistory {
+  [self cancelBracketSearch];
+  if (!preservingHistory && [self hasPendingHistoryNavigation]) {
+    [self cancelHistoryNavigation:nil];
+    [self setFindStatus:@"選択位置が変わったためUndo／Redoを中止しました。"];
+  }
+  if (!self.applyingSearchNavigation && ([self hasPendingSearchNavigation] || [self hasPendingReplacement])) {
+    [self cancelSearchNavigation];
+    [self setFindStatus:@"選択位置が変更されたため検索を中止しました。"];
+  }
+  ++_selectionGeneration;
   _committedSelection = selection;
   // Assignments from editing, search, IME or document refresh end the current
   // keyboard selection. Navigation restores these values after its assignment.
@@ -156,6 +359,8 @@ NSString* syntaxRole(sakura::core::SyntaxTokenKind kind) {
 - (instancetype)initWithFrame:(NSRect)frame document:(SakuraDocument*)document {
   self = [super initWithFrame:frame];
   if (self != nil) {
+    _cachedSyntaxTokens = emptySyntaxTokens();
+    _additionalSyntaxTokens = emptySyntaxTokens();
     _sakuraDocument = document;
     _committedSelection = NSMakeRange(0, 0);
     _navigationAnchor = NSNotFound;
@@ -166,6 +371,8 @@ NSString* syntaxRole(sakura::core::SyntaxTokenKind kind) {
     self.postsFrameChangedNotifications = YES;
     [self setAccessibilityElement:YES];
     [self setAccessibilityRole:NSAccessibilityTextAreaRole];
+    [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(editorWindowWillClose:)
+        name:NSWindowWillCloseNotification object:nil];
     [self documentContentsDidChange];
   }
   return self;
@@ -173,6 +380,18 @@ NSString* syntaxRole(sakura::core::SyntaxTokenKind kind) {
 
 - (BOOL)isFlipped {
   return YES;
+}
+
+- (void)viewDidMoveToWindow {
+  [super viewDidMoveToWindow];
+  if (self.window) self.historyWindowClosed = NO;
+}
+
+- (void)editorWindowWillClose:(NSNotification*)notification {
+  if (!self.window || notification.object != self.window) return;
+  self.historyWindowClosed = YES;
+  [self cancelSearchOperations:nil];
+  [self cancelSyntaxHighlighting:nil];
 }
 
 - (BOOL)acceptsFirstResponder {
@@ -242,10 +461,12 @@ NSString* syntaxRole(sakura::core::SyntaxTokenKind kind) {
   SakuraDocument* document = self.sakuraDocument;
   if (document == nil) return @"";
   const auto revision = document.documentSession.buffer().revision();
-  if (_cachedCommittedString == nil || _cachedTextRevision != revision) {
-    _cachedCommittedString = sakura::platform::mac::stringFromSakuraString(
-        document.documentSession.buffer().text());
+  if (_cachedCommittedString == nil || _cachedTextRevision != revision ||
+      !_cachedCommittedBuffer.sharesStorageWith(document.documentSession.buffer())) {
+    _cachedCommittedString = sakura::platform::mac::stringFromTextBuffer(
+        document.documentSession.buffer());
     _cachedTextRevision = revision;
+    _cachedCommittedBuffer = document.documentSession.buffer();
     _cachedDisplayString = nil;
     ++_textBuilds;
   }
@@ -264,13 +485,24 @@ NSString* syntaxRole(sakura::core::SyntaxTokenKind kind) {
   if (_cachedDisplayString == nil ||
       !NSEqualRanges(replacement, _cachedMarkedReplacement) ||
       ![_cachedMarkedString isEqualToString:marked]) {
-    NSMutableString* display = [committed mutableCopy];
-    [display replaceCharactersInRange:replacement withString:marked];
-    _cachedDisplayString = display;
+    if (self.sakuraDocument != nil) {
+      _cachedDisplayString = sakura::platform::mac::previewStringFromTextBuffer(
+          self.sakuraDocument.documentSession.buffer(), {replacement.location, replacement.length},
+          sakura::platform::mac::sakuraStringFromString(marked));
+    } else {
+      _cachedDisplayString = [committed stringByReplacingCharactersInRange:replacement withString:marked];
+    }
+    _cachedCompositionIdentity = [[NSObject alloc] init];
     _cachedMarkedString = [marked copy];
     _cachedMarkedReplacement = replacement;
   }
   return _cachedDisplayString;
+}
+
+- (id)compositionIdentity {
+  if (![self hasMarkedText]) return NSNull.null;
+  (void)[self displayString];
+  return _cachedCompositionIdentity;
 }
 
 - (NSRange)displaySelection {
@@ -291,6 +523,7 @@ NSString* syntaxRole(sakura::core::SyntaxTokenKind kind) {
   self.markedSelectionStorage = NSMakeRange(0, 0);
   _markedLayoutBuffer.reset();
   _markedLayoutString = nil;
+  [self invalidateOutdatedSyntax];
 }
 
 - (NSRange)committedRangeForDisplayRange:(NSRange)displayRange {
@@ -334,14 +567,14 @@ NSString* syntaxRole(sakura::core::SyntaxTokenKind kind) {
                       committed.length);
 }
 
-- (void)replaceCommittedRange:(NSRange)range withString:(NSString*)text {
+- (BOOL)replaceCommittedRange:(NSRange)range withString:(NSString*)text {
   [self clearRectangularSelection];
   NSString* committed = [self committedString];
   range = clampedRange(range, committed.length);
   if (range.length == 0 && text.length == 0) {
     self.committedSelection = NSMakeRange(range.location, 0);
     [self setNeedsDisplay:YES];
-    return;
+    return YES;
   }
 
   try {
@@ -355,8 +588,10 @@ NSString* syntaxRole(sakura::core::SyntaxTokenKind kind) {
     [self.sakuraDocument noteEditorChange:NSChangeDone];
     [self.sakuraDocument refreshEditorViews];
     [self scrollSelectionToVisible];
+    return YES;
   } catch (const std::exception&) {
     NSBeep();
+    return NO;
   }
 }
 
@@ -436,11 +671,32 @@ NSString* syntaxRole(sakura::core::SyntaxTokenKind kind) {
 }
 
 - (void)documentContentsDidChange {
+  [self cancelBracketSearch];
+  if (!self.applyingHistoryTransition && [self hasPendingHistoryNavigation]) {
+    [self cancelHistoryNavigation:nil];
+    [self setFindStatus:@"本文が変わったためUndo／Redoを中止しました。"];
+  }
+  if ([self hasPendingSearchNavigation] || [self hasPendingReplacement]) {
+    [self cancelSearchNavigation];
+    [self setFindStatus:@"本文が変更されたため検索を中止しました。"];
+  }
+  [self cancelSearchHighlights];
+  if (self.searchCountProgress != nil && self.searchCountRevision != self.sakuraDocument.documentSession.buffer().revision()) {
+    [self.searchCountProgress cancel]; self.searchCountProgress = nil;
+    [self setFindStatus:@"本文が変更されたため件数確認を中止しました。"];
+  }
   [self clearRectangularSelection];
   const NSUInteger length = [self committedString].length;
-  self.committedSelection = clampedRange(self.committedSelection, length);
+  // Only this automatic clamp preserves the queued history transition. A
+  // selection change reentered from a notification still uses the public
+  // setter and cancels the queue, even while the history refresh is running.
+  NSRange selection = clampedRange(self.committedSelection, length);
+  if (selection.length) selection = [self rangeByExpandingToEditBoundaries:selection];
+  else selection.location = [self previousEditBoundaryAtOrBefore:selection.location];
+  [self updateCommittedSelection:selection preservingHistory:self.applyingHistoryTransition];
   [self updateDocumentViewSize];
   [self setNeedsDisplay:YES];
+  [self refreshSearchScopeLabel];
 }
 
 - (void)displaySettingsDidChange {
@@ -466,27 +722,17 @@ NSString* syntaxRole(sakura::core::SyntaxTokenKind kind) {
   [self setNeedsDisplay:YES];
 }
 
-- (const std::vector<NSRange>&)displayLineRanges {
+- (const SakuraLayoutRows&)displayLineRanges {
   NSString* display = [self displayString];
   SakuraEditorSettings* settings = [self editorSettings];
   NSFont* font = [self baseTextAttributes][NSFontAttributeName];
   const NSSize viewport = self.enclosingScrollView != nil
                               ? self.enclosingScrollView.contentSize
                               : self.bounds.size;
-  NSArray* key = @[font.fontName, @(font.pointSize), @(settings.characterSpacing),
-      @(settings.tabWidth), @(settings.wrapMode), @(settings.wrapColumn),
-      @(settings.wrapMode == SakuraEditorWrapModeWindow ? viewport.width : 0.0),
-      @([self hasMarkedText])];
+  NSArray* key = layoutConfigurationKey(settings, font, viewport);
   if (_layoutDisplayString == display && [_layoutKey isEqual:key]) {
     return _cachedLineRanges;
   }
-  _layoutDisplayString = display;
-  _layoutKey = key;
-  _cachedLineRanges.clear();
-  _cachedLogicalLines.clear();
-  _cachedWidestLine = 0.0;
-  ++_layoutBuilds;
-  [_styledLines removeAllObjects];
   // Use the same layout for the input method's preview, without committing it
   // to the document, undo history, or another pane. Font/viewport changes can
   // reuse this temporary buffer while selectedRange-only updates reuse layout.
@@ -494,8 +740,21 @@ NSString* syntaxRole(sakura::core::SyntaxTokenKind kind) {
   const sakura::core::TextBuffer* layoutBuffer = nullptr;
   if ([self hasMarkedText] || self.sakuraDocument == nil) {
     if (_markedLayoutBuffer == nullptr || _markedLayoutString != display) {
-      _markedLayoutBuffer = std::make_unique<sakura::core::TextBuffer>(
-          sakura::platform::mac::sakuraStringFromString(display));
+      NSRange replacement = clampedRange(self.markedReplacementRangeStorage,
+          document != nil ? document.documentSession.buffer().length() : 0);
+      if (document != nil && document.documentSession.buffer().isEditBoundary(replacement.location) &&
+          document.documentSession.buffer().isEditBoundary(NSMaxRange(replacement))) {
+        auto preview = std::make_unique<sakura::core::TextBuffer>(document.documentSession.buffer());
+        preview->replace({replacement.location, replacement.length},
+            sakura::platform::mac::sakuraStringFromString(self.markedTextStorage.string));
+        _markedLayoutBuffer = std::move(preview); ++_imeSharedBuilds;
+      } else {
+        // Preserve NSTextInputClient previews that temporarily address a
+        // partial UTF-16/CRLF boundary. Such ranges cannot be core edits.
+        _markedLayoutBuffer = std::make_unique<sakura::core::TextBuffer>(
+            sakura::platform::mac::sakuraStringFromString(display));
+        ++_imeFullBuilds;
+      }
       _markedLayoutString = display;
     }
     layoutBuffer = _markedLayoutBuffer.get();
@@ -508,7 +767,6 @@ NSString* syntaxRole(sakura::core::SyntaxTokenKind kind) {
   sakura::platform::mac::CoreTextMetrics metrics(
       fontName != nullptr ? fontName : "Menlo-Regular", font.pointSize,
       settings.characterSpacing);
-  sakura::core::LayoutEngine engine;
   const sakura::core::FontStyle style{0, static_cast<float>(font.pointSize),
                                       400, false};
   float wrapWidth = 0.0F;
@@ -518,38 +776,67 @@ NSString* syntaxRole(sakura::core::SyntaxTokenKind kind) {
   } else if (settings.wrapMode == SakuraEditorWrapModeColumn) {
     wrapWidth = metrics.advance(u' ', style) * settings.wrapColumn;
   }
-  const auto layout = engine.layout(
+  const auto metricsRevision = _layoutMetricsRevision + (![_layoutKey isEqual:key] ? 1 : 0);
+  _cachedLineRanges.index.update(
       *layoutBuffer, metrics, style,
       {.wrapWidth = wrapWidth,
        .tabWidth = static_cast<sakura::core::TextOffset>(
-           settings.tabWidth)});
-
-  _cachedLineRanges.reserve(layout.visualLines.size());
-  _cachedLogicalLines.reserve(layout.visualLines.size());
-  const auto& buffer = *layoutBuffer;
-  std::size_t logicalLine = 0;
-  sakura::core::TextOffset logicalStart = 0;
-  for (const auto& visual : layout.visualLines) {
-    // Layout rows are ordered. Accumulate offsets once instead of making a
-    // prefix-index query for every fragment in a million-line cold layout.
-    while (logicalLine < visual.logicalLine) {
-      const auto& previous = buffer.line(logicalLine++);
-      logicalStart += previous.content.size();
-      switch (previous.ending) {
-        case sakura::core::LineEnding::none: break;
-        case sakura::core::LineEnding::lineFeed:
-        case sakura::core::LineEnding::carriageReturn: ++logicalStart; break;
-        case sakura::core::LineEnding::carriageReturnLineFeed: logicalStart += 2; break;
-      }
-    }
-    const auto start = logicalStart + visual.startColumn;
-    _cachedLineRanges.push_back(NSMakeRange(static_cast<NSUInteger>(start),
-                                 static_cast<NSUInteger>(visual.endColumn -
-                                                         visual.startColumn)));
-    _cachedLogicalLines.push_back(visual.logicalLine);
-    _cachedWidestLine = std::max<CGFloat>(_cachedWidestLine, visual.width);
-  }
+           settings.tabWidth)}, metricsRevision);
+  const auto statistics = _cachedLineRanges.index.lastUpdate();
+  _layoutMeasuredLines = statistics.measuredLines;
+  _layoutComparedTextNodes = statistics.comparedTextNodes;
+  if (statistics.fullRebuild) ++_layoutFullBuilds;
+  _layoutMetricsRevision = metricsRevision;
+  _cachedWidestLine = _cachedLineRanges.index.widestLine();
+  _layoutDisplayString = display;
+  _layoutKey = key;
+  ++_layoutBuilds;
+  [_styledLines removeAllObjects];
   return _cachedLineRanges;
+}
+
+- (NSArray*)layoutConfigurationKey {
+  NSSize viewport = self.enclosingScrollView ? self.enclosingScrollView.contentSize : self.bounds.size;
+  return layoutConfigurationKey([self editorSettings], [self baseTextAttributes][NSFontAttributeName], viewport);
+}
+- (NSArray<SakuraEditorView*>*)replacementAffectedViews {
+  NSMutableArray<SakuraEditorView*>* views = [NSMutableArray arrayWithObject:self];
+  for (NSWindowController* controller in self.sakuraDocument.windowControllers) {
+    if (![controller isKindOfClass:SakuraWindowController.class]) continue;
+    for (SakuraEditorView* view in ((SakuraWindowController*)controller).editorViews)
+      if (![views containsObject:view]) [views addObject:view];
+  }
+  return views;
+}
+- (ReplacementViewLayout)captureReplacementLayout {
+  SakuraEditorSettings* settings = [self editorSettings];
+  NSFont* font = [self baseTextAttributes][NSFontAttributeName];
+  const NSSize viewport = self.enclosingScrollView ? self.enclosingScrollView.contentSize : self.bounds.size;
+  NSArray* key = layoutConfigurationKey(settings, font, viewport);
+  const char* name = font.fontName.UTF8String;
+  return {self, key, name ? name : "Menlo-Regular", static_cast<float>(font.pointSize),
+      static_cast<float>(settings.characterSpacing), settings.wrapMode, settings.wrapColumn, settings.tabWidth,
+      viewport.width, _layoutMetricsRevision + (![_layoutKey isEqual:key] ? 1 : 0), _cachedLineRanges.index, {}};
+}
+- (void)adoptReplacementLayout:(ReplacementViewLayout&)work {
+  [self adoptPreparedLayout:work];
+  ++_replacementLayoutsAdopted;
+}
+- (void)adoptPreparedLayout:(ReplacementViewLayout&)work {
+  // Keep the old layout alive in the worker-owned result. Releasing a million
+  // obsolete row descriptors here would otherwise move the pause to commit.
+  work.retired = _cachedLineRanges.index;
+  _cachedLineRanges.index = work.layout;
+  _layoutMetricsRevision = work.metricsRevision;
+  _layoutKey = work.key;
+  _layoutDisplayString = [self displayString];
+  _cachedWidestLine = work.layout.widestLine();
+  const auto statistics = work.layout.lastUpdate();
+  _layoutMeasuredLines = statistics.measuredLines;
+  _layoutComparedTextNodes = statistics.comparedTextNodes;
+  if (statistics.fullRebuild) ++_layoutFullBuilds;
+  ++_layoutBuilds;
+  [_styledLines removeAllObjects];
 }
 
 - (void)updateDocumentViewSize {
@@ -574,6 +861,7 @@ NSString* syntaxRole(sakura::core::SyntaxTokenKind kind) {
       std::abs(self.frame.size.height - height) > 0.5) {
     [self setFrameSize:NSMakeSize(width, height)];
   }
+  [self invalidateOutdatedSyntax];
 }
 
 - (void)refreshStyledLineCache {
@@ -582,8 +870,9 @@ NSString* syntaxRole(sakura::core::SyntaxTokenKind kind) {
   NSMutableArray* key = [NSMutableArray arrayWithArray:
       @[type, [self baseTextAttributes], @(SakuraThemeIsDark(self.effectiveAppearance))]];
   NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
-  for (NSString* role in @[@"comment", @"string", @"keyword", @"number",
-                            @"preprocessor", @"search"]) {
+  NSMutableArray* roles = [NSMutableArray arrayWithArray:@[@"comment", @"string", @"keyword", @"number", @"preprocessor", @"search"]];
+  for (NSUInteger group = 2; group <= 10; ++group) [roles addObject:SakuraKeywordRole(group)];
+  for (NSString* role in roles) {
     id color = [defaults objectForKey:SakuraTypeColorPreferenceKey(
         type, role, self.effectiveAppearance)];
     [key addObject:color != nil ? color : NSNull.null];
@@ -625,14 +914,9 @@ NSString* syntaxRole(sakura::core::SyntaxTokenKind kind) {
     }
     return attributes;
   };
-  auto tokenStart = std::lower_bound(_cachedSyntaxTokens.begin(),
-      _cachedSyntaxTokens.end(), range.location,
-      [](const auto& token, NSUInteger start) {
-        return token.range.location + token.range.length <= start;
-      });
-  for (auto iterator = tokenStart; iterator != _cachedSyntaxTokens.end() &&
-       iterator->range.location < NSMaxRange(range); ++iterator) {
-    NSString* role = syntaxRole(iterator->kind);
+  const auto visibleTokens = [self syntaxTokensInRange:range];
+  for (auto iterator = visibleTokens.begin(); iterator != visibleTokens.end(); ++iterator) {
+    NSString* role = syntaxRole(*iterator);
     if (!SakuraTypeStyleBool(type, role, @"display", YES)) continue;
     NSColor* fallback = SakuraEditorText(self.effectiveAppearance);
     switch (iterator->kind) {
@@ -641,7 +925,7 @@ NSString* syntaxRole(sakura::core::SyntaxTokenKind kind) {
       case sakura::core::SyntaxTokenKind::string:
         fallback = SakuraStringText(self.effectiveAppearance); break;
       case sakura::core::SyntaxTokenKind::keyword:
-        fallback = SakuraKeywordText(self.effectiveAppearance); break;
+        fallback = SakuraKeywordGroupText(iterator->keywordGroup, self.effectiveAppearance); break;
       case sakura::core::SyntaxTokenKind::number:
         fallback = SakuraNumberText(self.effectiveAppearance); break;
       case sakura::core::SyntaxTokenKind::preprocessor:
@@ -691,7 +975,7 @@ NSString* syntaxRole(sakura::core::SyntaxTokenKind kind) {
 
   NSString* display = [self displayString];
   const auto& ranges = [self displayLineRanges];
-  const auto& syntaxTokens = [self activeSyntaxTokens];
+  [self prepareSyntax];
   const auto& searchRanges = [self activeSearchRanges];
   [self refreshStyledLineCache];
   const NSRange selected = clampedRange([self displaySelection], display.length);
@@ -748,12 +1032,13 @@ NSString* syntaxRole(sakura::core::SyntaxTokenKind kind) {
           std::ceil((NSMaxY(dirtyRect) - kVerticalInset) / lineHeight))));
   std::size_t previousLogicalLine = std::numeric_limits<std::size_t>::max();
   if (firstVisible != 0 && firstVisible <= ranges.size()) {
-    previousLogicalLine = _cachedLogicalLines[firstVisible - 1];
+    previousLogicalLine = _cachedLineRanges.logicalLine(firstVisible - 1);
   }
   const BOOL showLineNumbers = [self editorSettings].showsLineNumbers;
+  NSIndexSet* bookmarks = [self.sakuraDocument bookmarkLines];
   for (NSUInteger lineIndex = firstVisible; lineIndex < endVisible; ++lineIndex) {
     const CGFloat top = kVerticalInset + lineIndex * lineHeight;
-    const auto logicalLine = _cachedLogicalLines[lineIndex];
+    const auto logicalLine = _cachedLineRanges.logicalLine(lineIndex);
     if (logicalLine != previousLogicalLine &&
         showLineNumbers &&
         SakuraTypeStyleBool(typeIdentifier, @"gutter", @"display", YES)) {
@@ -761,6 +1046,10 @@ NSString* syntaxRole(sakura::core::SyntaxTokenKind kind) {
       [number drawInRect:NSMakeRect(4.0, top + 1.0, kGutterWidth - 10.0,
                                     lineHeight)
             withAttributes:lineNumberAttributes];
+      if ([bookmarks containsIndex:logicalLine]) {
+        [NSColor.systemBlueColor setFill];
+        [[NSBezierPath bezierPathWithOvalInRect:NSMakeRect(2, top + 5, 5, 5)] fill];
+      }
     }
     previousLogicalLine = logicalLine;
   }
@@ -857,6 +1146,7 @@ NSString* syntaxRole(sakura::core::SyntaxTokenKind kind) {
     CTLineRef line = CTLineCreateWithAttributedString(
         (__bridge CFAttributedStringRef)lineText);
 
+    const auto syntaxTokens = [self syntaxTokensInRange:lineRange];
     auto tokenStart = std::lower_bound(syntaxTokens.begin(), syntaxTokens.end(),
         lineRange.location, [](const auto& token, NSUInteger start) {
           return token.range.location + token.range.length <= start;
@@ -864,16 +1154,7 @@ NSString* syntaxRole(sakura::core::SyntaxTokenKind kind) {
     for (auto iterator = tokenStart; iterator != syntaxTokens.end() &&
          iterator->range.location < NSMaxRange(lineRange); ++iterator) {
       const auto& token = *iterator;
-      NSString* role = nil;
-      switch (token.kind) {
-        case sakura::core::SyntaxTokenKind::comment: role = @"comment"; break;
-        case sakura::core::SyntaxTokenKind::string: role = @"string"; break;
-        case sakura::core::SyntaxTokenKind::keyword: role = @"keyword"; break;
-        case sakura::core::SyntaxTokenKind::number: role = @"number"; break;
-        case sakura::core::SyntaxTokenKind::preprocessor:
-          role = @"preprocessor";
-          break;
-      }
+      NSString* role = syntaxRole(token);
       if (!SakuraTypeStyleBool(typeIdentifier, role, @"display", YES)) {
         continue;
       }
@@ -1383,49 +1664,203 @@ NSString* syntaxRole(sakura::core::SyntaxTokenKind kind) {
 }
 
 - (void)findTextFromToolbar:(NSString*)text {
-  if (text.length == 0) {
-    NSBeep();
-    return;
-  }
-  if ([self hasMarkedText]) {
-    [self unmarkText];
-  }
-  try {
-    const auto needle = sakura::platform::mac::sakuraStringFromString(text);
-    const auto match = self.sakuraDocument.documentSession.findNext(
-        needle, NSMaxRange(self.committedSelection),
-        {.caseSensitive = true, .wholeWord = false, .wrap = true});
-    if (!match.has_value()) {
-      NSBeep();
-      return;
-    }
-    [self clearRectangularSelection];
-    [self recordNavigationToOffset:
-        static_cast<NSUInteger>(match->range.location)];
-    self.committedSelection = NSMakeRange(
-        static_cast<NSUInteger>(match->range.location),
-        static_cast<NSUInteger>(match->range.length));
-    [self setNeedsDisplay:YES];
-    [self scrollSelectionToVisible];
-  } catch (const std::exception&) {
-    NSBeep();
-  }
+  if (text.length == 0) { NSBeep(); return; }
+  [self prepareFindPanel];
+  self.findField.stringValue = text;
+  [self findNext:self];
 }
 
 #pragma mark - Find and replace
 
+- (SakuraSearchState*)searchState { return SakuraSearchState.sharedState; }
+- (void)refreshSearchHistoryControls {
+  self.findField.recentsAutosaveName = nil;
+  self.findField.maximumRecents = 20;
+  self.findField.recentSearches = [self searchState].queryHistory;
+  [self.replacementHistoryPopup removeAllItems]; [self.replacementHistoryPopup addItemWithTitle:@"置換履歴"];
+  for (NSString* value in [self searchState].replacementHistory) {
+    NSString* title = value.length ? value : @"（空文字）";
+    if (title.length > 40) title = [[title substringToIndex:[title rangeOfComposedCharacterSequencesForRange:NSMakeRange(0, 40)].length] stringByAppendingString:@"…"];
+    title = [title stringByReplacingOccurrencesOfString:@"\n" withString:@"↵"];
+    title = [title stringByReplacingOccurrencesOfString:@"\r" withString:@"↵"];
+    [self.replacementHistoryPopup addItemWithTitle:title];
+    self.replacementHistoryPopup.lastItem.representedObject = value;
+  }
+}
+- (void)loadSharedSearchCriteria {
+  [self cancelSearchNavigation];
+  [self cancelSearchHighlights];
+  [self.searchCountProgress cancel]; self.searchCountProgress = nil;
+  [self setFindStatus:@""];
+  NSDictionary* value = [self searchState].criteria;
+  self.findField.stringValue = value[@"query"]; self.replaceField.stringValue = value[@"replacement"];
+  self.caseSensitiveButton.state = [value[@"caseSensitive"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff;
+  self.wholeWordButton.state = [value[@"wholeWord"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff;
+  self.regularExpressionButton.state = [value[@"regex"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff;
+  self.searchWrapButton.state = [value[@"wrap"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff;
+  self.hasLastSearchMatch = NO; self.searchMarksHidden = NO;
+  [self refreshSearchHistoryControls]; [self setNeedsDisplay:YES];
+}
+- (void)sharedSearchDidChange:(NSNotification*)notification {
+  if (notification.userInfo[@"source"] == self || [[self searchCriteriaDictionary] isEqual:[self searchState].criteria]) [self refreshSearchHistoryControls];
+  else [self loadSharedSearchCriteria];
+}
+- (NSDictionary*)searchCriteriaDictionary {
+  return @{
+    @"query":self.findField.stringValue != nil ? self.findField.stringValue : @"",
+    @"replacement":self.replaceField.stringValue != nil ? self.replaceField.stringValue : @"",
+    @"caseSensitive":@(self.caseSensitiveButton.state == NSControlStateValueOn),
+    @"wholeWord":@(self.wholeWordButton.state == NSControlStateValueOn),
+    @"regex":@(self.regularExpressionButton.state == NSControlStateValueOn),
+    @"wrap":@(self.searchWrapButton == nil || self.searchWrapButton.state == NSControlStateValueOn)};
+}
+- (BOOL)publishSearchCriteria:(BOOL)remember replacement:(BOOL)replace {
+  if (self.searchCountProgress) { [self.searchCountProgress cancel]; self.searchCountProgress = nil; [self setFindStatus:@""]; }
+  BOOL saved = [[self searchState] updateCriteria:[self searchCriteriaDictionary]
+    source:self rememberQuery:remember rememberReplacement:replace];
+  if (!saved) [self setFindStatus:@"検索文字列は4,096、置換文字列は65,536 UTF-16単位までです。"];
+  [self refreshSearchHistoryControls]; return saved;
+}
+- (void)chooseReplacementHistory:(id)sender {
+  (void)sender;
+  id value = self.replacementHistoryPopup.selectedItem.representedObject;
+  if ([value isKindOfClass:NSString.class]) { [self cancelSearchNavigation]; self.replaceField.stringValue = value; [self publishSearchCriteria:NO replacement:NO]; }
+}
+- (void)clearSharedSearchHistory:(id)sender {
+  (void)sender; [self prepareFindPanel]; [[self searchState] clearHistory];
+  [self setFindStatus:@"起動中の共有検索履歴を消去しました。"];
+}
+- (BOOL)searchScopeIsValid {
+  if (self.searchScopeButton.state != NSControlStateValueOn) return YES;
+  if (!self.searchScopeCaptured || self.sakuraDocument == nil ||
+      self.searchScopeRevision != self.sakuraDocument.documentSession.buffer().revision()) return NO;
+  const auto& buffer = self.sakuraDocument.documentSession.buffer();
+  NSRange range = self.searchScopeRange;
+  return range.location <= buffer.length() && range.length <= buffer.length() - range.location &&
+      buffer.isEditBoundary(range.location) && buffer.isEditBoundary(NSMaxRange(range));
+}
+- (BOOL)ensureSearchScope {
+  if ([self searchScopeIsValid]) return YES;
+  [self setFindStatus:@"範囲指定後に本文が変更されました。選択し直し「範囲を再指定」を押してください。"];
+  [self refreshSearchScopeLabel]; return NO;
+}
+- (void)refreshSearchScopeLabel {
+  if (self.searchScopeButton.state != NSControlStateValueOn) self.searchScopeLabel.stringValue = @"文書全体";
+  else if (![self searchScopeIsValid]) self.searchScopeLabel.stringValue = @"範囲が変更されています（再指定が必要）";
+  else {
+    const auto& buffer = self.sakuraDocument.documentSession.buffer();
+    auto start = buffer.positionAt(self.searchScopeRange.location), end = buffer.positionAt(NSMaxRange(self.searchScopeRange));
+    self.searchScopeLabel.stringValue = [NSString stringWithFormat:@"%zu行%llu桁 〜 %zu行%llu桁", start.line + 1,
+        (unsigned long long)start.column + 1, end.line + 1, (unsigned long long)end.column + 1];
+  }
+}
+- (BOOL)captureCurrentSearchScope {
+  if (self.hasMarkedText) [self unmarkText];
+  if (self.hasRectangularSelection || !self.committedSelection.length) {
+    [self setFindStatus:@"通常の範囲選択をしてから指定してください（矩形範囲は未対応）。"]; return NO;
+  }
+  self.searchScopeRange = self.committedSelection;
+  [self cancelSearchNavigation];
+  [self cancelSearchHighlights];
+  [self.searchCountProgress cancel]; self.searchCountProgress = nil;
+  self.searchScopeRevision = self.sakuraDocument.documentSession.buffer().revision(); self.searchScopeCaptured = YES;
+  self.searchScopeButton.state = NSControlStateValueOn; self.hasLastSearchMatch = NO;
+  [self refreshSearchScopeLabel]; [self setNeedsDisplay:YES]; return YES;
+}
+- (void)captureSearchScope:(id)sender { (void)sender; [self captureCurrentSearchScope]; }
+- (void)changeSearchScope:(id)sender {
+  (void)sender;
+  [self cancelSearchNavigation];
+  [self cancelSearchHighlights];
+  [self.searchCountProgress cancel]; self.searchCountProgress = nil;
+  if (self.searchScopeButton.state == NSControlStateValueOn && ![self captureCurrentSearchScope] && !self.searchScopeCaptured)
+    self.searchScopeButton.state = NSControlStateValueOff;
+  self.hasLastSearchMatch = NO; [self refreshSearchScopeLabel]; [self setNeedsDisplay:YES];
+}
+- (void)useSelectionForFind:(id)sender {
+  (void)sender;
+  if (self.hasMarkedText) [self unmarkText];
+  if (self.hasRectangularSelection || !self.committedSelection.length || self.committedSelection.length > 4096) {
+    NSBeep(); return;
+  }
+  NSString* text = [[self committedString] substringWithRange:self.committedSelection];
+  [self cancelSearchNavigation];
+  [self prepareFindPanel]; self.findField.stringValue = text; self.regularExpressionButton.state = NSControlStateValueOff;
+  [self publishSearchCriteria:YES replacement:NO]; [self setFindStatus:@"選択文字列を通常検索に設定しました。"];
+}
+
+- (void)countSearchMatches:(id)sender {
+  [self cancelSearchNavigation];
+  [self prepareFindPanel];
+  if ([sender isKindOfClass:NSMenuItem.class]) [self showFindPanel:sender];
+  if (self.hasMarkedText) [self unmarkText];
+  if (![self ensureSearchScope]) return;
+  if (!self.findField.stringValue.length) { [self setFindStatus:@"検索文字列を入力してください。"]; return; }
+  if (![self publishSearchCriteria:YES replacement:NO]) return;
+  const auto needle = sakura::platform::mac::sakuraStringFromString(self.findField.stringValue);
+  auto options = [self searchOptions];
+  const auto& buffer = self.sakuraDocument.documentSession.buffer();
+  if (buffer.length() > 4 * 1024 * 1024 || buffer.lineCount() > 100000) {
+    [self setFindStatus:@"件数確認の上限は4Mi UTF-16／100,000行です。通常検索は利用できます。"]; return;
+  }
+  auto snapshot = std::make_shared<const sakura::core::TextBuffer>(buffer);
+  const auto revision = buffer.revision();
+  NSString* query = self.findField.stringValue.copy;
+  const auto flags = [self searchFlags];
+  const NSRange scope = self.searchScopeRange;
+  self.searchCountRevision = revision;
+  NSProgress* progress = [NSProgress progressWithTotalUnitCount:1]; self.searchCountProgress = progress;
+  [self setFindStatus:@"一致件数を確認しています…"];
+  options.captureGroups = false; options.maxMatches = 100001; options.regexTimeLimitMilliseconds = 250;
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  options.cancelled = [progress, deadline] { return static_cast<bool>(progress.cancelled) || std::chrono::steady_clock::now() > deadline; };
+  __weak SakuraEditorView* weakSelf = self;
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    @autoreleasepool {
+      NSUInteger count = 0; BOOL failed = NO, invalid = NO;
+      try {
+        if (!sakura::core::SearchEngine::isValidPattern(needle, options)) invalid = YES;
+        else count = sakura::core::SearchEngine{}.findAll(*snapshot, needle, options).size();
+      }
+      catch (const std::exception&) { failed = YES; }
+      dispatch_async(dispatch_get_main_queue(), ^{
+        SakuraEditorView* editor = weakSelf;
+        if (editor == nil || editor.searchCountProgress != progress) return;
+        editor.searchCountProgress = nil;
+        if (progress.cancelled || editor.sakuraDocument == nil || editor.sakuraDocument.documentSession.buffer().revision() != revision) {
+          [editor setFindStatus:@"本文が変更されたか処理が取り消されたため、件数確認を中止しました。"]; return;
+        }
+        if (![editor searchScopeIsValid] || ![editor.findField.stringValue isEqual:query] ||
+            [editor searchFlags] != flags || !NSEqualRanges(editor.searchScopeRange, scope)) {
+          [editor setFindStatus:@"検索条件が変更されたため件数確認を中止しました。"]; return;
+        }
+        if (invalid) [editor setFindStatus:@"正規表現が正しくありません。"];
+        else if (failed) [editor setFindStatus:@"件数確認を中止しました（時間・メモリ上限または検索エラー）。"];
+        else if (count > 100000) [editor setFindStatus:@"100,000件を超えています（件数確認の上限）。"];
+        else [editor setFindStatus:[NSString stringWithFormat:@"%lu 件一致しました。", (unsigned long)count]];
+      });
+    }
+  });
+}
+
 - (sakura::core::SearchOptions)searchOptions {
-  return {.caseSensitive = self.caseSensitiveButton.state == NSControlStateValueOn,
+  sakura::core::SearchOptions options{.caseSensitive = self.caseSensitiveButton.state == NSControlStateValueOn,
           .wholeWord = self.wholeWordButton.state == NSControlStateValueOn,
-          .wrap = true,
+          .wrap = self.searchWrapButton == nil || self.searchWrapButton.state == NSControlStateValueOn,
           .regularExpression = self.regularExpressionButton.state ==
                                NSControlStateValueOn};
+  if (self.searchScopeButton.state == NSControlStateValueOn) {
+    if (![self searchScopeIsValid]) throw std::runtime_error("Selection search scope is stale");
+    options.range = sakura::core::TextRange{self.searchScopeRange.location, self.searchScopeRange.length};
+  }
+  return options;
 }
 
 - (NSUInteger)searchFlags {
   const auto options = [self searchOptions];
   return (options.caseSensitive ? 1 : 0) | (options.wholeWord ? 2 : 0) |
-         (options.regularExpression ? 4 : 0);
+         (options.regularExpression ? 4 : 0) | (options.wrap ? 8 : 0) |
+         (options.range ? 16 : 0);
 }
 
 - (void)rememberSearchSelection {
@@ -1434,89 +1869,334 @@ NSString* syntaxRole(sakura::core::SyntaxTokenKind kind) {
   self.lastSearchRevision = self.sakuraDocument.documentSession.buffer().revision();
   self.lastSearchPattern = self.findField.stringValue;
   self.lastSearchFlags = [self searchFlags];
+  self.lastSearchSelectionGeneration = self.selectionGeneration;
 }
 
 - (void)setFindStatus:(NSString*)status {
+  self.searchOperationStatusText = status;
   self.findStatusLabel.stringValue = status;
+  if ([self.window.windowController isKindOfClass:SakuraWindowController.class]) {
+    SakuraWindowController* controller = (SakuraWindowController*)self.window.windowController;
+    NSResponder* responder = self.window.firstResponder;
+    if ([responder isKindOfClass:SakuraEditorView.class] ? responder == self : controller.editorView == self)
+      [controller updateStatusForEditor:self];
+  }
 }
 
-- (const std::vector<sakura::core::SyntaxToken>&)activeSyntaxTokens {
+- (NSArray*)currentSyntaxKey {
   SakuraDocument* document = self.sakuraDocument;
   NSString* extension = document.fileURL.pathExtension.lowercaseString;
-  if (extension == nil) extension = @"";
-  NSArray* key = @[@(document != nil ? document.documentSession.buffer().revision() : 0),
-                   extension, @([self hasMarkedText])];
-  if ([_syntaxKey isEqual:key]) return _cachedSyntaxTokens;
+  return @[@(document != nil ? document.documentSession.buffer().revision() : 0),
+      extension != nil ? extension : @"", [self compositionIdentity],
+      [self syntaxPreferences], [NSValue valueWithNonretainedObject:document]];
+}
+
+- (void)invalidateOutdatedSyntax {
+  if (_syntaxKey == nil) return;
+  SakuraDocument* document = self.sakuraDocument;
+  if (!self.syntaxProgress.cancelled && document != nil && [_syntaxKey isEqual:[self currentSyntaxKey]] && _syntaxSource &&
+      _syntaxSource->sharesStorageWith(document.documentSession.buffer())) return;
+  [self.syntaxProgress cancel]; self.syntaxProgress = nil;
+  _syntaxKey = nil;
+  // Releasing a large token array or obsolete text tree is not drawing work.
+  auto retired = std::make_shared<RetiredSyntax>(RetiredSyntax{std::move(_cachedSyntaxTokens),
+      std::move(_additionalSyntaxTokens), std::move(_cachedSyntaxIndex), std::move(_syntaxSource)});
+  _cachedSyntaxTokens = emptySyntaxTokens();
+  _additionalSyntaxTokens = emptySyntaxTokens(); _flattenedSyntaxReady = NO;
+  dispatch_async(syntaxPreparationQueue(), ^{ *retired = {}; });
+  [_styledLines removeAllObjects];
+  [self setSyntaxStatusMessage:@""];
+  [self setCustomSyntaxStatusMessage:@""];
+}
+
+- (BOOL)syntaxKeyIsCurrent:(NSArray*)key progress:(NSProgress*)progress
+                    source:(const sakura::core::TextBuffer&)source {
+  return self.syntaxProgress == progress && !progress.cancelled && self.sakuraDocument != nil &&
+      [_syntaxKey isEqual:key] && [[self currentSyntaxKey] isEqual:key] &&
+      source.sharesStorageWith(self.sakuraDocument.documentSession.buffer());
+}
+
+- (SyntaxTokens)syntaxTokensInRange:(NSRange)range {
+  if (!range.length) return {};
+  auto result = _cachedSyntaxIndex ? _cachedSyntaxIndex->tokensIn({range.location,range.length}) : SyntaxTokens{};
+  const auto baseCount = result.size();
+  auto extra = std::lower_bound(_additionalSyntaxTokens->begin(), _additionalSyntaxTokens->end(), range.location,
+      [](const auto& t, NSUInteger start) { return t.range.location+t.range.length <= start; });
+  for (; extra != _additionalSyntaxTokens->end() && extra->range.location < NSMaxRange(range); ++extra) result.push_back(*extra);
+  if (result.size() != baseCount)
+    std::sort(result.begin(),result.end(),[](const auto& a,const auto& b){return a.range.location<b.range.location;});
+  return result;
+}
+
+// Compatibility diagnostics used by object tests. Drawing uses range queries,
+// never this whole-document materialization.
+- (const std::vector<sakura::core::SyntaxToken>&)activeSyntaxTokens {
+  [self prepareSyntax];
+  if (!_flattenedSyntaxReady) {
+    const auto length = self.hasMarkedText ? [self displayString].length : self.sakuraDocument.documentSession.buffer().length();
+    _cachedSyntaxTokens = std::make_shared<const SyntaxTokens>([self syntaxTokensInRange:NSMakeRange(0,length)]);
+    _flattenedSyntaxReady = YES;
+    ++_syntaxFlattenBuilds;
+  }
+  return *_cachedSyntaxTokens;
+}
+
+- (void)prepareSyntax {
+  [self invalidateOutdatedSyntax];
+  if (_syntaxKey != nil) return;
+  NSArray* key = [self currentSyntaxKey];
   _syntaxKey = key;
   ++_syntaxBuilds;
   [_styledLines removeAllObjects];
-  _cachedSyntaxTokens.clear();
-  if (document != nil && ![self hasMarkedText] &&
-      [@[ @"c", @"cc", @"cpp", @"cxx", @"h", @"hh", @"hpp", @"hxx",
-           @"m", @"mm", @"swift" ] containsObject:extension]) {
-    _cachedSyntaxTokens = sakura::core::SyntaxHighlighter{}.highlightCLike(
-        document.documentSession.buffer());
+  SakuraDocument* document = self.sakuraDocument;
+  if (document == nil) return;
+  NSDictionary* preferences = key[3];
+  const auto language = sakura::core::SyntaxHighlighter::languageForExtension([key[1] UTF8String]);
+  const BOOL custom = SakuraSyntaxPreferencesHaveRules(preferences);
+  try {
+    _syntaxSource = std::make_shared<const sakura::core::TextBuffer>(document.documentSession.buffer());
+    if (language == sakura::core::SyntaxLanguage::plain && !custom) return;
+    // Layout already owns the current IME preview. Copy its immutable root,
+    // never serialize the full display NSString on the main thread.
+    if ([self hasMarkedText]) [self displayLineRanges];
+    auto payload = std::make_shared<std::unique_ptr<SyntaxWork>>(std::make_unique<SyntaxWork>(
+        SyntaxWork{_syntaxSource, [self hasMarkedText] && _markedLayoutBuffer ? *_markedLayoutBuffer : *_syntaxSource,
+            _previousSyntaxIndex, {}, {}, {}, {}, {}}));
+    NSProgress* progress = [NSProgress progressWithTotalUnitCount:1];
+    self.syntaxProgress = progress;
+    [self setSyntaxStatusMessage:language == sakura::core::SyntaxLanguage::plain ? @"" : @"通常色分け中…（Escで中止）"];
+    [self setCustomSyntaxStatusMessage:custom ? @"追加色分け待機中…" : @""];
+    __weak SakuraEditorView* weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 75 * NSEC_PER_MSEC), syntaxPreparationQueue(), ^{
+      @autoreleasepool {
+        const BOOL ranOnMain = NSThread.isMainThread;
+        NSString* baseMessage = @"";
+        NSString* customMessage = @"";
+        auto& work = **payload;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        try {
+          sakura::core::IndexedSyntax candidate = work.previous ? *work.previous : sakura::core::IndexedSyntax{};
+          candidate.update(work.display, language, [progress, deadline] {
+                return static_cast<bool>(progress.cancelled) || std::chrono::steady_clock::now() > deadline;
+              });
+          work.base = std::make_shared<const sakura::core::IndexedSyntax>(std::move(candidate));
+          // Publish immutable base tokens first. Custom rules can take longer,
+          // but never run against a missing/incomplete comment/string mask.
+          dispatch_async(dispatch_get_main_queue(), ^{
+            SakuraEditorView* target = weakSelf;
+            if (target == nil || ![target syntaxKeyIsCurrent:key progress:progress source:*(*payload)->source]) return;
+            auto& accepted = **payload;
+            accepted.retiredIndex = std::move(target->_previousSyntaxIndex);
+            target->_previousSyntaxIndex = accepted.base;
+            target->_cachedSyntaxIndex = accepted.base;
+            target->_syntaxUpdate = accepted.base->lastUpdate();
+            target->_cachedSyntaxTokens = emptySyntaxTokens(); target->_flattenedSyntaxReady = NO;
+            [target->_styledLines removeAllObjects];
+            [target setSyntaxStatusMessage:@""];
+            [target setCustomSyntaxStatusMessage:custom ? @"追加色分け中…" : @""];
+            [target setNeedsDisplay:YES];
+          });
+        } catch (const std::exception&) {
+          baseMessage = std::chrono::steady_clock::now() > deadline
+              ? @"通常色分け: 時間上限（装飾なしで表示）" : @"通常色分けを中止しました（解析・メモリエラー）。";
+        }
+        if (work.base && custom && !progress.cancelled) {
+          using Status = sakura::core::CustomSyntaxStatus;
+          sakura::core::CustomSyntaxResult result;
+          try {
+            sakura::core::CustomSyntaxRules rules;
+            if (work.display.length() > sakura::core::kCustomSyntaxTextLimit ||
+                work.display.lineCount() > sakura::core::kCustomSyntaxLineLimit) result.status = Status::tooLarge;
+            else if (SakuraParseSyntaxPreferences(preferences, rules)) result.status = Status::invalidRules;
+            else {
+              auto mask = work.base->tokens([progress] { return static_cast<bool>(progress.cancelled); });
+              result = sakura::core::highlightCustomSyntax(work.display, mask, rules,
+                  [progress] { return static_cast<bool>(progress.cancelled); });
+            }
+            if (result.status == Status::ok) {
+              work.additional = std::make_shared<const SyntaxTokens>(std::move(result.tokens));
+            }
+          } catch (const std::exception&) { result.status = progress.cancelled ? Status::cancelled : Status::tooLarge; }
+          switch (result.status) {
+            case Status::ok: case Status::cancelled: break;
+            case Status::invalidRules: customMessage = @"追加色分け: 設定エラー"; break;
+            case Status::tooLarge: customMessage = @"追加色分け: サイズ／行数上限"; break;
+            case Status::tooManyMatches: customMessage = @"追加色分け: 10,000件上限"; break;
+            case Status::timedOut: customMessage = @"追加色分け: 時間上限（通常表示を継続）"; break;
+          }
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+          SakuraEditorView* target = weakSelf;
+          if (target != nil) {
+            if ([target syntaxKeyIsCurrent:key progress:progress source:*(*payload)->source]) {
+              auto& completed = **payload;
+              completed.retiredDiagnostic = std::move(target->_cachedSyntaxTokens);
+              completed.retiredAdditional = std::move(target->_additionalSyntaxTokens);
+              target->_cachedSyntaxTokens = emptySyntaxTokens(); target->_flattenedSyntaxReady = NO;
+              target->_additionalSyntaxTokens = completed.additional ? completed.additional : emptySyntaxTokens();
+              target.syntaxProgress = nil;
+              ++target->_syntaxCompletions; target->_syntaxWorkerRanOnMainThread = ranOnMain;
+              [target->_styledLines removeAllObjects];
+              [target setSyntaxStatusMessage:baseMessage];
+              [target setCustomSyntaxStatusMessage:baseMessage.length ? @"" : customMessage];
+              [target setNeedsDisplay:YES];
+            } else {
+              ++target->_syntaxDiscards;
+              if (target.syntaxProgress == progress) [target invalidateOutdatedSyntax];
+            }
+          }
+          // Main callbacks hold only the small payload handle. Discarded
+          // source snapshots and token arrays are destroyed on the worker.
+          dispatch_async(syntaxPreparationQueue(), ^{ payload->reset(); });
+        });
+      }
+    });
+  } catch (const std::exception&) {
+    self.syntaxProgress = nil;
+    [self setSyntaxStatusMessage:@"通常色分けを開始できませんでした。"];
   }
-  return _cachedSyntaxTokens;
+}
+
+- (NSArray*)searchHighlightKey {
+  SakuraDocument* document = self.sakuraDocument;
+  NSString* pattern = self.findField.stringValue.copy;
+  if (pattern == nil) pattern = @"";
+  const BOOL enabled = document != nil && !self.searchMarksHidden &&
+      self.findPanel.isVisible && pattern.length != 0 && ![self hasMarkedText] && [self searchScopeIsValid];
+  return @[@(document != nil ? document.documentSession.buffer().revision() : 0),
+                   pattern, @(enabled ? [self searchFlags] : 0), @(enabled),
+                   @(self.searchScopeRange.location), @(self.searchScopeRange.length),
+                   [NSValue valueWithNonretainedObject:document]];
 }
 
 - (const std::vector<NSRange>&)activeSearchRanges {
-  SakuraDocument* document = self.sakuraDocument;
-  NSString* pattern = self.findField.stringValue;
-  if (pattern == nil) pattern = @"";
-  const BOOL enabled = document != nil && !self.searchMarksHidden &&
-      self.findPanel.isVisible && pattern.length != 0 && ![self hasMarkedText];
-  NSArray* key = @[@(document != nil ? document.documentSession.buffer().revision() : 0),
-                   pattern, @([self searchFlags]), @(enabled)];
+  NSArray* key = [self searchHighlightKey];
   if ([_searchKey isEqual:key]) return _cachedSearchRanges;
+  [self.searchHighlightProgress cancel]; self.searchHighlightProgress = nil;
   _searchKey = key;
   ++_searchBuilds;
   [_styledLines removeAllObjects];
   _cachedSearchRanges.clear();
-  if (!enabled) {
+  if (![key[3] boolValue]) {
+    [self setSearchHighlightStatusMessage:@""];
     return _cachedSearchRanges;
   }
   try {
+    if (self.findField.stringValue.length > 4096) {
+      [self setSearchHighlightStatusMessage:@"検索強調の文字列上限は4,096 UTF-16単位です。"];
+      return _cachedSearchRanges;
+    }
     const auto needle = sakura::platform::mac::sakuraStringFromString(
         self.findField.stringValue);
-    const auto matches = self.sakuraDocument.documentSession.findAll(
-        needle, [self searchOptions]);
-    _cachedSearchRanges.reserve(matches.size());
-    for (const auto& match : matches) {
-      _cachedSearchRanges.push_back(NSMakeRange(static_cast<NSUInteger>(match.range.location),
-                                   static_cast<NSUInteger>(match.range.length)));
-    }
+    auto options = [self searchOptions]; options.captureGroups = false; options.maxMatches = 10001;
+    auto snapshot = std::make_shared<const sakura::core::TextBuffer>(self.sakuraDocument.documentSession.buffer());
+    NSProgress* progress = [NSProgress progressWithTotalUnitCount:1]; self.searchHighlightProgress = progress;
+    [self setSearchHighlightStatusMessage:@"検索強調を更新中…"];
+    __weak SakuraEditorView* weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC),
+        dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+      @autoreleasepool {
+        if (progress.cancelled) return;
+        const BOOL ranOnMain = NSThread.isMainThread;
+        std::shared_ptr<std::vector<NSRange>> ranges;
+        NSString* message = @"";
+        try {
+          auto workerOptions = options;
+          auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+          workerOptions.regexTimeLimitMilliseconds = 250;
+          workerOptions.cancelled = [progress, deadline] { return static_cast<bool>(progress.cancelled) || std::chrono::steady_clock::now() > deadline; };
+          ranges = std::make_shared<std::vector<NSRange>>();
+          if (!sakura::core::SearchEngine::isValidPattern(needle, workerOptions)) message = @"正規表現が正しくありません（検索強調）。";
+          else {
+            const auto matches = sakura::core::SearchEngine{}.findAll(*snapshot, needle, workerOptions);
+            ranges->reserve(std::min<std::size_t>(10000, matches.size()));
+            for (std::size_t index = 0; index < std::min<std::size_t>(10000, matches.size()); ++index)
+              ranges->push_back(NSMakeRange(matches[index].range.location, matches[index].range.length));
+            if (matches.size() > 10000) message = @"検索強調は先頭10,000件までです。";
+          }
+        } catch (const std::exception&) { message = @"検索強調を中止しました（時間・メモリ上限または検索エラー）。"; }
+        dispatch_async(dispatch_get_main_queue(), ^{
+          SakuraEditorView* editor = weakSelf;
+          if (!editor) return;
+          if (editor.searchHighlightProgress != progress || progress.cancelled ||
+              ![editor->_searchKey isEqual:key] || ![[editor searchHighlightKey] isEqual:key]) {
+            ++editor->_searchDiscards;
+            if (editor.searchHighlightProgress == progress) {
+              editor.searchHighlightProgress = nil; editor->_searchKey = nil;
+              editor->_cachedSearchRanges.clear(); [editor->_styledLines removeAllObjects];
+              [editor setSearchHighlightStatusMessage:@""]; [editor setNeedsDisplay:YES];
+            }
+            return;
+          }
+          editor.searchHighlightProgress = nil; ++editor->_searchCompletions;
+          editor->_searchWorkerRanOnMainThread = ranOnMain;
+          if (ranges) editor->_cachedSearchRanges.swap(*ranges);
+          else editor->_cachedSearchRanges.clear();
+          [editor->_styledLines removeAllObjects];
+          [editor setSearchHighlightStatusMessage:message]; [editor setNeedsDisplay:YES];
+        });
+      }
+    });
   } catch (const std::exception&) {
-    // Rendering a transient, malformed search must not disturb editing.
+    [self setSearchHighlightStatusMessage:@"検索強調を開始できませんでした。"];
   }
   return _cachedSearchRanges;
 }
 
 - (NSDictionary<NSString*, NSNumber*>*)renderingStatistics {
   return @{@"textBuilds":@(_textBuilds), @"layoutBuilds":@(_layoutBuilds),
+           @"layoutMeasuredLines":@(_layoutMeasuredLines), @"layoutFullBuilds":@(_layoutFullBuilds),
+           @"layoutComparedTextNodes":@(_layoutComparedTextNodes),
            @"syntaxBuilds":@(_syntaxBuilds), @"searchBuilds":@(_searchBuilds),
+           @"syntaxPending":@([self hasPendingSyntax]), @"syntaxCompletions":@(_syntaxCompletions),
+           @"syntaxDiscards":@(_syntaxDiscards), @"syntaxWorkerOnMain":@(_syntaxWorkerRanOnMainThread),
+           @"syntaxParsedUnits":@(_syntaxUpdate.parsedUnits), @"syntaxSerializedUnits":@(_syntaxUpdate.serializedUnits),
+           @"syntaxReusedUnits":@(_syntaxUpdate.reusedUnits), @"syntaxRebuiltBlocks":@(_syntaxUpdate.rebuiltBlocks),
+           @"syntaxFullRebuild":@(_syntaxUpdate.fullRebuild),
+           @"syntaxFlattenBuilds":@(_syntaxFlattenBuilds),
            @"styledBuilds":@(_styledBuilds), @"drawnLines":@(_drawnLines),
-           @"lineLookupSteps":@(_lineLookupSteps)};
+           @"lineLookupSteps":@(_lineLookupSteps), @"searchCompletions":@(_searchCompletions),
+           @"searchDiscards":@(_searchDiscards), @"searchWorkerOnMain":@(_searchWorkerRanOnMainThread),
+           @"searchPending":@(self.searchHighlightProgress != nil),
+           @"imeSharedBuilds":@(_imeSharedBuilds), @"imeFullBuilds":@(_imeFullBuilds),
+           @"navigationPending":@([self hasPendingSearchNavigation]), @"navigationCompletions":@(_navigationCompletions),
+           @"navigationDiscards":@(_navigationDiscards), @"navigationWorkerOnMain":@(_navigationWorkerRanOnMainThread),
+           @"replacementPending":@([self hasPendingReplacement]), @"replacementCompletions":@(_replacementCompletions),
+           @"replacementDiscards":@(_replacementDiscards), @"replacementWorkerOnMain":@(_replacementWorkerRanOnMainThread),
+           @"replacementLayoutsAdopted":@(_replacementLayoutsAdopted), @"replacementMainMilliseconds":@(_replacementMainMilliseconds),
+           @"replacementAdoptMilliseconds":@(_replacementAdoptMilliseconds), @"replacementRefreshMilliseconds":@(_replacementRefreshMilliseconds),
+           @"historyPending":@([self hasPendingHistoryNavigation]), @"historyQueuedRequests":@(_historyRequests.size()),
+           @"historyCompletions":@(_historyCompletions), @"historyDiscards":@(_historyDiscards),
+           @"historyWorkerOnMain":@(_historyWorkerRanOnMainThread), @"historyLayoutsAdopted":@(_historyLayoutsAdopted),
+           @"historyMainMilliseconds":@(_historyMainMilliseconds), @"historyAdoptMilliseconds":@(_historyAdoptMilliseconds),
+           @"historyRefreshMilliseconds":@(_historyRefreshMilliseconds)};
 }
 
 - (void)refreshSearchHighlights:(id)sender {
   (void)sender;
+  [self cancelSearchNavigation];
+  [self cancelSearchHighlights];
+  [self setFindStatus:@""];
+  [self publishSearchCriteria:NO replacement:NO];
   self.searchMarksHidden = NO;
   [self setNeedsDisplay:YES];
 }
 
 - (void)controlTextDidChange:(NSNotification*)notification {
-  if (notification.object == self.findField) {
+  if (notification.object == self.findField || notification.object == self.replaceField) {
+    [self cancelSearchNavigation];
+    [self cancelSearchHighlights];
+    [self setFindStatus:@""];
+    [self publishSearchCriteria:NO replacement:NO];
     self.searchMarksHidden = NO;
     [self setNeedsDisplay:YES];
   }
 }
 
-- (void)showFindPanel:(id)sender {
-  (void)sender;
+- (void)prepareFindPanel {
   if (self.findPanel == nil) {
     NSPanel* panel = [[NSPanel alloc]
-        initWithContentRect:NSMakeRect(0, 0, 500, 178)
+        initWithContentRect:NSMakeRect(0, 0, 660, 254)
                   styleMask:NSWindowStyleMaskTitled |
                             NSWindowStyleMaskClosable |
                             NSWindowStyleMaskUtilityWindow
@@ -1528,195 +2208,284 @@ NSString* syntaxRole(sakura::core::SyntaxTokenKind kind) {
 
     NSView* content = panel.contentView;
     const CGFloat labelX = 16.0;
-    const CGFloat fieldX = 94.0;
-    const CGFloat fieldWidth = 384.0;
+    const CGFloat fieldX = 110.0;
+    const CGFloat fieldWidth = 440.0;
     NSTextField* findLabel = [NSTextField labelWithString:@"検索文字列:"];
-    findLabel.frame = NSMakeRect(labelX, 130, 70, 22);
+    findLabel.frame = NSMakeRect(labelX, 210, 88, 22);
     [content addSubview:findLabel];
     NSSearchField* findField = [[NSSearchField alloc]
-        initWithFrame:NSMakeRect(fieldX, 126, fieldWidth, 26)];
+        initWithFrame:NSMakeRect(fieldX, 206, 540, 26)];
     findField.sendsSearchStringImmediately = NO;
     findField.delegate = self;
     findField.target = self;
     findField.action = @selector(findNext:);
+    findField.toolTip = @"履歴は起動中だけ共有します。強調表示は先頭10,000件までです。";
     [content addSubview:findField];
 
     NSTextField* replaceLabel = [NSTextField labelWithString:@"置換文字列:"];
-    replaceLabel.frame = NSMakeRect(labelX, 94, 70, 22);
+    replaceLabel.frame = NSMakeRect(labelX, 174, 88, 22);
     [content addSubview:replaceLabel];
     NSTextField* replaceField = [[NSTextField alloc]
-        initWithFrame:NSMakeRect(fieldX, 90, fieldWidth, 26)];
+        initWithFrame:NSMakeRect(fieldX, 170, fieldWidth, 26)];
+    replaceField.delegate = self;
     [content addSubview:replaceField];
 
     NSButton* caseSensitive = [NSButton checkboxWithTitle:@"大文字と小文字を区別"
                                                     target:self
                                                     action:@selector(refreshSearchHighlights:)];
-    caseSensitive.frame = NSMakeRect(fieldX, 61, 125, 22);
+    caseSensitive.frame = NSMakeRect(fieldX, 138, 180, 22);
     caseSensitive.state = NSControlStateValueOn;
     [content addSubview:caseSensitive];
     NSButton* wholeWord = [NSButton checkboxWithTitle:@"単語単位"
                                                 target:self
                                                 action:@selector(refreshSearchHighlights:)];
-    wholeWord.frame = NSMakeRect(225, 61, 105, 22);
+    wholeWord.frame = NSMakeRect(300, 138, 100, 22);
     [content addSubview:wholeWord];
     NSButton* regularExpression = [NSButton checkboxWithTitle:@"正規表現"
                                                         target:self
                                                         action:@selector(refreshSearchHighlights:)];
-    regularExpression.frame = NSMakeRect(338, 61, 145, 22);
+    regularExpression.frame = NSMakeRect(410, 138, 110, 22);
     [content addSubview:regularExpression];
+    NSButton* cancel = [NSButton buttonWithTitle:@"検索中止" target:self action:@selector(cancelSearchOperations:)];
+    cancel.frame = NSMakeRect(16,135,80,26); [content addSubview:cancel];
 
     NSButton* previousButton = [NSButton buttonWithTitle:@"上検索"
                                                     target:self
                                                     action:@selector(findPrevious:)];
-    previousButton.frame = NSMakeRect(16, 25, 80, 28);
+    previousButton.frame = NSMakeRect(16, 66, 84, 28);
     [content addSubview:previousButton];
     NSButton* findButton = [NSButton buttonWithTitle:@"下検索"
                                                 target:self
                                                 action:@selector(findNext:)];
-    findButton.frame = NSMakeRect(102, 25, 80, 28);
+    findButton.frame = NSMakeRect(106, 66, 84, 28);
     findButton.keyEquivalent = @"\r";
     [content addSubview:findButton];
     NSButton* replaceButton = [NSButton buttonWithTitle:@"置換"
                                                    target:self
                                                    action:@selector(replaceSearchSelection:)];
-    replaceButton.frame = NSMakeRect(188, 25, 80, 28);
+    replaceButton.frame = NSMakeRect(196, 66, 84, 28);
     [content addSubview:replaceButton];
     NSButton* replaceAllButton = [NSButton buttonWithTitle:@"すべて置換"
                                                       target:self
                                                       action:@selector(replaceAll:)];
-    replaceAllButton.frame = NSMakeRect(274, 25, 100, 28);
+    replaceAllButton.frame = NSMakeRect(286, 66, 110, 28);
     [content addSubview:replaceAllButton];
-    NSTextField* status = [NSTextField labelWithString:@""];
-    status.frame = NSMakeRect(16, 5, 468, 16);
+    NSTextField* status = [NSTextField wrappingLabelWithString:@""];
+    status.frame = NSMakeRect(16, 8, 634, 44);
     status.textColor = NSColor.secondaryLabelColor;
     [content addSubview:status];
 
     self.findPanel = panel;
+    panel.delegate = self;
     self.findField = findField;
     self.replaceField = replaceField;
     self.caseSensitiveButton = caseSensitive;
     self.wholeWordButton = wholeWord;
     self.regularExpressionButton = regularExpression;
     self.findStatusLabel = status;
+    self.searchWrapButton = [NSButton checkboxWithTitle:@"折返し検索" target:self action:@selector(refreshSearchHighlights:)];
+    self.searchWrapButton.frame = NSMakeRect(530, 138, 120, 22); [content addSubview:self.searchWrapButton];
+    self.searchScopeButton = [NSButton checkboxWithTitle:@"選択範囲内" target:self action:@selector(changeSearchScope:)];
+    self.searchScopeButton.frame = NSMakeRect(16, 107, 120, 22); [content addSubview:self.searchScopeButton];
+    NSButton* scope = [NSButton buttonWithTitle:@"範囲を再指定" target:self action:@selector(captureSearchScope:)];
+    scope.frame = NSMakeRect(140, 104, 130, 28); [content addSubview:scope];
+    self.searchScopeLabel = [NSTextField labelWithString:@"文書全体"];
+    self.searchScopeLabel.frame = NSMakeRect(282, 107, 368, 22); [content addSubview:self.searchScopeLabel];
+    NSButton* count = [NSButton buttonWithTitle:@"一致件数" target:self action:@selector(countSearchMatches:)];
+    count.frame = NSMakeRect(404, 66, 104, 28); [content addSubview:count];
+    NSButton* clear = [NSButton buttonWithTitle:@"履歴を消去" target:self action:@selector(clearSharedSearchHistory:)];
+    clear.frame = NSMakeRect(518, 66, 132, 28); [content addSubview:clear];
+    self.replacementHistoryPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(556, 170, 94, 26) pullsDown:YES];
+    self.replacementHistoryPopup.target = self; self.replacementHistoryPopup.action = @selector(chooseReplacementHistory:);
+    [content addSubview:self.replacementHistoryPopup];
+    [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(sharedSearchDidChange:)
+        name:SakuraSearchStateDidChangeNotification object:[self searchState]];
+    [self loadSharedSearchCriteria];
   }
+}
+
+- (void)showFindPanel:(id)sender {
+  (void)sender;
+  [self prepareFindPanel];
   [self.findPanel makeKeyAndOrderFront:self];
   [self.findPanel makeFirstResponder:self.findField];
 }
 
-- (BOOL)selectNextSearchMatchFrom:(NSUInteger)start {
-  self.hasLastSearchMatch = NO;
-  if (self.findField.stringValue.length == 0) {
-    [self setFindStatus:@"検索文字列を入力してください。"];
-    NSBeep();
-    return NO;
+- (BOOL)hasPendingSearchNavigation {
+  return self.searchNavigationProgress != nil || !_searchNavigationRequests.empty();
+}
+- (void)cancelSearchNavigation {
+  [self cancelPreparedReplacement];
+  [self.searchNavigationProgress cancel]; self.searchNavigationProgress = nil;
+  _searchNavigationRequests.clear(); self.searchNavigationContextKey = nil;
+}
+- (BOOL)hasPendingReplacement { return self.replacementProgress != nil; }
+- (void)cancelPreparedReplacement {
+  [self.replacementProgress cancel]; self.replacementProgress = nil;
+}
+- (NSArray*)navigationSearchKey {
+  SakuraDocument* document = self.sakuraDocument;
+  NSMutableDictionary* criteria = [[self searchCriteriaDictionary] mutableCopy];
+  criteria[@"query"] = [criteria[@"query"] copy];
+  criteria[@"replacement"] = [criteria[@"replacement"] copy];
+  return @[@(document != nil ? document.documentSession.buffer().revision() : 0),
+      [NSValue valueWithNonretainedObject:document], criteria.copy,
+      @(self.searchScopeButton.state == NSControlStateValueOn),
+      [NSValue valueWithRange:self.searchScopeRange], @(self.searchScopeRevision),
+      @(self.searchScopeCaptured), @([self hasMarkedText])];
+}
+- (BOOL)enqueueSearchNavigationPrevious:(BOOL)previous explicitStart:(NSUInteger)start {
+  [self cancelHistoryNavigation:nil];
+  [self cancelBracketSearch];
+  if (self.sakuraDocument.closingDocument || self.historyWindowClosed) return NO;
+  [self cancelPreparedReplacement];
+  if ([self hasPendingSearchNavigation] && ![self.searchNavigationContextKey isEqual:[self navigationSearchKey]])
+    [self cancelSearchNavigation];
+  if (self.sakuraDocument == nil || ![self ensureSearchScope]) { [self cancelSearchNavigation]; return NO; }
+  if (!self.findField.stringValue.length) {
+    [self cancelSearchNavigation]; [self setFindStatus:@"検索文字列を入力してください。"]; NSBeep(); return NO;
   }
+  if (![self publishSearchCriteria:YES replacement:NO]) { [self cancelSearchNavigation]; return NO; }
   try {
-    const auto needle = sakura::platform::mac::sakuraStringFromString(
-        self.findField.stringValue);
-    if (!sakura::core::SearchEngine::isValidPattern(needle, [self searchOptions])) {
-      [self setFindStatus:@"正規表現が正しくありません。"];
-      NSBeep();
-      return NO;
-    }
-    const auto match = self.sakuraDocument.documentSession.findNext(
-        needle, static_cast<sakura::core::TextOffset>(start),
-        [self searchOptions]);
-    if (!match.has_value()) {
-      [self setFindStatus:@"見つかりませんでした。"];
-      NSBeep();
-      return NO;
-    }
-    [self clearRectangularSelection];
-    [self recordNavigationToOffset:
-        static_cast<NSUInteger>(match->range.location)];
-    self.committedSelection = NSMakeRange(
-        static_cast<NSUInteger>(match->range.location),
-        static_cast<NSUInteger>(match->range.length));
-    [self rememberSearchSelection];
-    self.searchMarksHidden = NO;
-    [self setFindStatus:@"検索文字列を選択しました。"];
-    [self setNeedsDisplay:YES];
-    [self scrollSelectionToVisible];
+    if (![self hasPendingSearchNavigation]) self.searchNavigationContextKey = [self navigationSearchKey];
+    _searchNavigationRequests.push_back({previous,start});
+    if (self.searchNavigationProgress) {
+      [self setFindStatus:[NSString stringWithFormat:@"検索中…（次の操作 %lu 件を待機）", (unsigned long)_searchNavigationRequests.size()]];
+    } else [self startNextSearchNavigation];
     return YES;
   } catch (const std::exception&) {
-    [self setFindStatus:@"検索文字列が正しくありません。"];
-    NSBeep();
-    return NO;
+    [self cancelSearchNavigation]; [self setFindStatus:@"検索を開始できませんでした。"]; return NO;
   }
 }
-
+- (void)startNextSearchNavigation {
+  if (self.searchNavigationProgress) return;
+  if (_searchNavigationRequests.empty()) { self.searchNavigationContextKey = nil; return; }
+  if (self.sakuraDocument == nil || self.sakuraDocument.closingDocument || self.historyWindowClosed ||
+      ![self ensureSearchScope]) { [self cancelSearchNavigation]; return; }
+  const auto request = _searchNavigationRequests.front(); _searchNavigationRequests.pop_front();
+  try {
+    auto options = [self searchOptions];
+    NSUInteger start = request.explicitStart;
+    if (start == NSNotFound) {
+      start = request.previous ? self.committedSelection.location : NSMaxRange(self.committedSelection);
+      if (!request.previous && self.hasLastSearchMatch && !self.committedSelection.length &&
+          NSEqualRanges(self.committedSelection,self.lastSearchMatchRange) &&
+          self.lastSearchRevision == self.sakuraDocument.documentSession.buffer().revision() &&
+          self.lastSearchSelectionGeneration == self.selectionGeneration &&
+          [self.lastSearchPattern isEqual:self.findField.stringValue] && self.lastSearchFlags == [self searchFlags]) {
+        const auto& buffer = self.sakuraDocument.documentSession.buffer();
+        const auto limit = options.range ? options.range->location + options.range->length : buffer.length();
+        if (start >= limit && !options.wrap) {
+          [self setFindStatus:@"範囲の末尾です。見つかりませんでした。"];
+          if (_searchNavigationRequests.empty()) self.searchNavigationContextKey = nil;
+          else {
+            __weak SakuraEditorView* weakSelf = self;
+            dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf startNextSearchNavigation]; });
+          }
+          return;
+        }
+        if (start < limit) { do { ++start; } while (start < limit && !buffer.isEditBoundary(start)); }
+        else start = options.range ? options.range->location : 0;
+      }
+    }
+    const auto needle = sakura::platform::mac::sakuraStringFromString(self.findField.stringValue);
+    auto snapshot = std::make_shared<const sakura::core::TextBuffer>(self.sakuraDocument.documentSession.buffer());
+    NSArray* key = [self navigationSearchKey]; self.searchNavigationContextKey = key;
+    NSRange expectedSelection = self.committedSelection;
+    const auto generation = self.selectionGeneration;
+    NSProgress* progress = [NSProgress progressWithTotalUnitCount:2]; self.searchNavigationProgress = progress;
+    options.captureGroups = false; options.regexTimeLimitMilliseconds = 250;
+    self.hasLastSearchMatch = NO;
+    [self setFindStatus:request.previous ? @"上検索中…" : @"下検索中…"];
+    __weak SakuraEditorView* weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0), ^{
+      @autoreleasepool {
+        progress.completedUnitCount = 1;
+        if (progress.cancelled) { progress.completedUnitCount = 2; return; }
+        std::optional<sakura::core::SearchMatch> match;
+        BOOL invalid = NO, failed = NO;
+        const BOOL ranOnMain = NSThread.isMainThread;
+        try {
+          auto workerOptions = options;
+          const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+          workerOptions.cancelled = [progress,deadline] { return static_cast<bool>(progress.cancelled) || std::chrono::steady_clock::now() > deadline; };
+          if (!sakura::core::SearchEngine::isValidPattern(needle,workerOptions)) invalid = YES;
+          else if (request.previous) match = sakura::core::SearchEngine{}.findPrevious(*snapshot,needle,start,workerOptions);
+          else match = sakura::core::SearchEngine{}.findNext(*snapshot,needle,start,workerOptions);
+        } catch (const std::exception&) { failed = YES; }
+        progress.completedUnitCount = 2;
+        dispatch_async(dispatch_get_main_queue(), ^{
+          SakuraEditorView* editor = weakSelf;
+          if (editor == nil) return;
+          if (editor.searchNavigationProgress != progress) { ++editor->_navigationDiscards; return; }
+          if (progress.cancelled || editor.sakuraDocument.closingDocument || editor.historyWindowClosed ||
+              ![[editor navigationSearchKey] isEqual:key] ||
+              editor.selectionGeneration != generation || !NSEqualRanges(editor.committedSelection,expectedSelection)) {
+            ++editor->_navigationDiscards; [editor cancelSearchNavigation];
+            [editor setFindStatus:@"本文・条件・選択位置が変更されたため検索を中止しました。"]; return;
+          }
+          editor.searchNavigationProgress = nil;
+          ++editor->_navigationCompletions; editor->_navigationWorkerRanOnMainThread = ranOnMain;
+          if (invalid || failed) {
+            [editor cancelSearchNavigation];
+            [editor setFindStatus:invalid ? @"正規表現が正しくありません。" : @"検索を中止しました（時間・メモリ上限または検索エラー）。"];
+            return;
+          }
+          if (match) {
+            editor.applyingSearchNavigation = YES;
+            [editor clearRectangularSelection]; [editor recordNavigationToOffset:match->range.location];
+            editor.committedSelection = NSMakeRange(match->range.location,match->range.length);
+            editor.applyingSearchNavigation = NO;
+            [editor rememberSearchSelection]; editor.searchMarksHidden = NO;
+            [editor setFindStatus:@"検索文字列を選択しました。"];
+            [editor setNeedsDisplay:YES]; [editor scrollSelectionToVisible];
+          } else { [editor setFindStatus:@"見つかりませんでした。"]; NSBeep(); }
+          [editor startNextSearchNavigation];
+        });
+      }
+    });
+  } catch (const std::exception&) {
+    [self cancelSearchNavigation]; [self setFindStatus:@"検索を開始できませんでした。"];
+  }
+}
+- (BOOL)selectNextSearchMatchFrom:(NSUInteger)start {
+  return [self enqueueSearchNavigationPrevious:NO explicitStart:start];
+}
 - (void)findNext:(id)sender {
   (void)sender;
   if (self.findPanel == nil) {
-    [self showFindPanel:self];
-    return;
+    [self prepareFindPanel];
+    if (!self.findField.stringValue.length) { [self showFindPanel:self]; return; }
   }
-  if ([self hasMarkedText]) {
-    [self unmarkText];
-  }
-  NSUInteger start = NSMaxRange(self.committedSelection);
-  if (self.hasLastSearchMatch && self.committedSelection.length == 0 &&
-      NSEqualRanges(self.committedSelection, self.lastSearchMatchRange) &&
-      self.lastSearchRevision == self.sakuraDocument.documentSession.buffer().revision() &&
-      [self.lastSearchPattern isEqualToString:self.findField.stringValue] &&
-      self.lastSearchFlags == [self searchFlags]) {
-    const NSUInteger length = [self committedString].length;
-    start = start < length ? [self nextEditBoundaryAtOrAfter:start + 1] : 0;
-  }
-  [self selectNextSearchMatchFrom:start];
+  if ([self hasMarkedText]) [self unmarkText];
+  [self enqueueSearchNavigationPrevious:NO explicitStart:NSNotFound];
 }
-
 - (void)findPrevious:(id)sender {
   (void)sender;
   if (self.findPanel == nil) {
-    [self showFindPanel:self];
-    return;
+    [self prepareFindPanel];
+    if (!self.findField.stringValue.length) { [self showFindPanel:self]; return; }
   }
-  if (self.findField.stringValue.length == 0) {
-    [self setFindStatus:@"検索文字列を入力してください。"];
-    NSBeep();
-    return;
-  }
-  if ([self hasMarkedText]) {
-    [self unmarkText];
-  }
-  try {
-    const auto needle = sakura::platform::mac::sakuraStringFromString(
-        self.findField.stringValue);
-    const auto matches = self.sakuraDocument.documentSession.findAll(
-        needle, [self searchOptions]);
-    if (matches.empty()) {
-      [self setFindStatus:@"見つかりませんでした。"];
-      NSBeep();
-      return;
-    }
-    const NSUInteger cursor = self.committedSelection.location;
-    const sakura::core::SearchMatch* selected = &matches.back();
-    for (auto iterator = matches.rbegin(); iterator != matches.rend(); ++iterator) {
-      if (iterator->range.location < cursor) {
-        selected = &*iterator;
-        break;
-      }
-    }
-    [self clearRectangularSelection];
-    [self recordNavigationToOffset:
-        static_cast<NSUInteger>(selected->range.location)];
-    self.committedSelection = NSMakeRange(
-        static_cast<NSUInteger>(selected->range.location),
-        static_cast<NSUInteger>(selected->range.length));
-    [self rememberSearchSelection];
-    self.searchMarksHidden = NO;
-    [self setFindStatus:@"検索文字列を選択しました。"];
-    [self setNeedsDisplay:YES];
-    [self scrollSelectionToVisible];
-  } catch (const std::exception&) {
-    [self setFindStatus:@"検索文字列が正しくありません。"];
-    NSBeep();
-  }
+  if ([self hasMarkedText]) [self unmarkText];
+  [self enqueueSearchNavigationPrevious:YES explicitStart:NSNotFound];
+}
+- (void)cancelSearchOperations:(id)sender {
+  (void)sender;
+  [self cancelHistoryNavigation:nil];
+  [self cancelBracketSearch];
+  [self cancelSearchNavigation]; [self cancelSearchHighlights];
+  [self.searchCountProgress cancel]; self.searchCountProgress = nil;
+  self.searchMarksHidden = YES;
+  [self setFindStatus:@"検索処理を中止しました。"]; [self setNeedsDisplay:YES];
+}
+- (void)windowWillClose:(NSNotification*)notification {
+  if (notification.object == self.findPanel) [self cancelSearchOperations:nil];
 }
 
 - (void)clearSearchMarks:(id)sender {
   (void)sender;
+  [self cancelSearchNavigation];
+  [self cancelSearchHighlights];
   self.searchMarksHidden = YES;
   [self setFindStatus:@"検索マークを解除しました。"];
   [self setNeedsDisplay:YES];
@@ -1724,53 +2493,23 @@ NSString* syntaxRole(sakura::core::SyntaxTokenKind kind) {
 
 - (void)replaceSearchSelection:(id)sender {
   (void)sender;
-  if (self.findPanel == nil) {
-    [self showFindPanel:self];
-    return;
+  [self cancelPreparedReplacement];
+  if ([self hasPendingSearchNavigation]) {
+    [self setFindStatus:@"検索中です。完了後に置換を実行してください。"]; return;
   }
-  if ([self hasMarkedText]) {
-    [self unmarkText];
-  }
-  try {
-    const auto needle = sakura::platform::mac::sakuraStringFromString(
-        self.findField.stringValue);
-    auto options = [self searchOptions];
-    options.wrap = false;
-    if (!sakura::core::SearchEngine::isValidPattern(needle, options)) {
-      [self setFindStatus:@"正規表現が正しくありません。"];
-      NSBeep();
-      return;
-    }
-    const auto current = self.sakuraDocument.documentSession.findNext(
-        needle, self.committedSelection.location, options);
-    if (!current.has_value() ||
-        current->range.location != self.committedSelection.location ||
-        current->range.length != self.committedSelection.length) {
-      [self selectNextSearchMatchFrom:self.committedSelection.location];
-      return;
-    }
-    const auto replacement = sakura::platform::mac::sakuraStringFromString(
-        self.replaceField.stringValue);
-    const auto expanded = self.sakuraDocument.documentSession.replacementText(
-        *current, replacement, options);
-    const BOOL emptyMatch = self.committedSelection.length == 0;
-    [self replaceCommittedRange:self.committedSelection
-                     withString:sakura::platform::mac::stringFromSakuraString(expanded)];
-    [self setFindStatus:@"置換しました。"];
-    NSUInteger next = NSMaxRange(self.committedSelection);
-    if (emptyMatch) {
-      const NSUInteger length = [self committedString].length;
-      next = next < length ? [self nextEditBoundaryAtOrAfter:next + 1] : 0;
-    }
-    [self selectNextSearchMatchFrom:next];
-  } catch (const std::exception&) {
-    [self setFindStatus:@"置換文字列が正しくありません。"];
-    NSBeep();
-  }
+  [self prepareSearchReplacementAll:NO];
 }
 
 - (void)replaceAll:(id)sender {
   (void)sender;
+  [self cancelSearchNavigation];
+  [self prepareSearchReplacementAll:YES];
+}
+
+- (void)prepareSearchReplacementAll:(BOOL)all {
+  [self cancelHistoryNavigation:nil];
+  [self cancelBracketSearch];
+  if (self.sakuraDocument.closingDocument || self.historyWindowClosed) return;
   if (self.findPanel == nil) {
     [self showFindPanel:self];
     return;
@@ -1784,27 +2523,183 @@ NSString* syntaxRole(sakura::core::SyntaxTokenKind kind) {
     [self unmarkText];
   }
   try {
+    if (self.sakuraDocument == nil || ![self ensureSearchScope]) return;
+    // Publishing history can notify peer panes. Freeze the final criteria only
+    // after that notification, before taking the immutable edit snapshot.
+    if (![self publishSearchCriteria:YES replacement:YES]) return;
     const auto needle = sakura::platform::mac::sakuraStringFromString(
         self.findField.stringValue);
     const auto replacement = sakura::platform::mac::sakuraStringFromString(
         self.replaceField.stringValue);
-    const auto result = self.sakuraDocument.documentSession.replaceAll(
-        needle, replacement, [self searchOptions]);
-    if (!result.valid) {
-      [self setFindStatus:@"正規表現または置換文字列が正しくありません。"];
-      NSBeep();
-      return;
+    auto options = [self searchOptions]; options.maxReplacementCodeUnits = (all ? 128 : 64) * 1024 * 1024;
+    auto layouts = std::make_shared<std::vector<ReplacementViewLayout>>();
+    BOOL paneCompositionAtStart = NO;
+    for (SakuraEditorView* view in [self replacementAffectedViews]) {
+      if (view.sakuraDocument != self.sakuraDocument) {
+        [self setFindStatus:@"ペインの文書が変わったため置換を中止しました。"];
+        return;
+      }
+      if (view.hasMarkedText) {
+        if (all) {
+          [self setFindStatus:@"別のペインでIME入力中です。未確定文字を確定してから置換してください。"];
+          return;
+        }
+        paneCompositionAtStart = YES;
+      }
+      layouts->push_back([view captureReplacementLayout]);
     }
-    if (result.replacements == 0) {
-      [self setFindStatus:@"見つかりませんでした。"];
-      NSBeep();
-      return;
-    }
-    self.committedSelection = NSMakeRange(0, 0);
-    [self.sakuraDocument noteEditorChange:NSChangeDone];
-    [self.sakuraDocument refreshEditorViews];
-    [self setFindStatus:[NSString stringWithFormat:@"%zu 件置換しました。",
-                                                   result.replacements]];
+    const auto snapshot = std::make_shared<const sakura::core::EditEngine::Snapshot>(
+        self.sakuraDocument.documentSession.editSnapshot());
+    NSArray* key = [self navigationSearchKey];
+    const NSRange expectedSelection = self.committedSelection;
+    const auto selectionGeneration = self.selectionGeneration;
+    NSProgress* progress = [NSProgress progressWithTotalUnitCount:1];
+    self.replacementProgress = progress;
+    [self setFindStatus:all ? @"全置換を準備しています…（検索中止／⌘.で中止）" : @"置換を準備しています…（検索中止／⌘.で中止）"];
+    auto payload = std::make_shared<std::unique_ptr<sakura::app::PreparedSearchReplacement>>();
+    __weak SakuraEditorView* weakSelf = self;
+    dispatch_async(replacementPreparationQueue(), ^{
+      @autoreleasepool {
+        NSString* error = nil;
+        const BOOL ranOnMain = NSThread.isMainThread;
+        try {
+          auto workerOptions = options;
+          const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+          workerOptions.regexTimeLimitMilliseconds = 250;
+          workerOptions.cancelled = [progress, deadline] {
+            return static_cast<bool>(progress.cancelled) || std::chrono::steady_clock::now() > deadline;
+          };
+          if (progress.cancelled) throw std::runtime_error("replacement cancelled before start");
+          *payload = std::make_unique<sakura::app::PreparedSearchReplacement>(all
+              ? sakura::app::DocumentSession::prepareReplaceAll(*snapshot, needle, replacement, workerOptions)
+              : sakura::app::DocumentSession::prepareSingleReplacement(*snapshot,
+                  {expectedSelection.location,expectedSelection.length},needle,replacement,workerOptions));
+          if ((*payload)->result.valid && (*payload)->result.changed && paneCompositionAtStart)
+            error = @"別のペインでIME入力中です。未確定文字を確定してから置換してください。";
+          if (error == nil && (*payload)->result.valid && (*payload)->result.changed) {
+            for (auto& work : *layouts) {
+              if (workerOptions.cancelled()) throw std::runtime_error("replacement layout cancelled");
+              sakura::platform::mac::CoreTextMetrics metrics(work.fontName, work.pointSize, work.characterSpacing);
+              const sakura::core::FontStyle style{0, work.pointSize, 400, false};
+              float wrap = 0;
+              if (work.wrapMode == SakuraEditorWrapModeWindow)
+                wrap = std::max(1.0F, static_cast<float>(work.viewportWidth - kGutterWidth - 2 * kHorizontalInset));
+              else if (work.wrapMode == SakuraEditorWrapModeColumn)
+                wrap = metrics.advance(u' ', style) * work.wrapColumn;
+              work.layout.update((*payload)->edit.resultingBuffer(), metrics, style,
+                  {.wrapWidth = wrap, .tabWidth = static_cast<sakura::core::TextOffset>(work.tabWidth)},
+                  work.metricsRevision, workerOptions.cancelled);
+            }
+          }
+        } catch (const std::exception&) {
+          error = @"置換を中止しました（時間・件数・文字数上限、検索／置換エラー）。本文は変更していません。";
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+          SakuraEditorView* editor = weakSelf;
+          BOOL textApplied = NO, editNotified = NO;
+          const auto callbackStarted = std::chrono::steady_clock::now();
+          try {
+          if (editor != nil) {
+            editor->_replacementWorkerRanOnMainThread = ranOnMain;
+            bool current = editor.replacementProgress == progress && !progress.cancelled &&
+                editor.sakuraDocument != nil && !editor.sakuraDocument.closingDocument &&
+                !editor.historyWindowClosed && editor.selectionGeneration == selectionGeneration &&
+                NSEqualRanges(editor.committedSelection,expectedSelection) &&
+                [[editor navigationSearchKey] isEqual:key];
+            const bool requiresLayouts = error == nil && *payload && (*payload)->result.valid && (*payload)->result.changed;
+            NSArray<SakuraEditorView*>* currentViews = current && requiresLayouts ? [editor replacementAffectedViews] : nil;
+            if (requiresLayouts) current = current && currentViews.count == layouts->size();
+            if (current && requiresLayouts) for (const auto& work : *layouts) {
+              SakuraEditorView* view = work.view;
+              if (view == nil || view.sakuraDocument != editor.sakuraDocument || ![currentViews containsObject:view] || view.hasMarkedText ||
+                  ![[view layoutConfigurationKey] isEqual:work.key]) { current = false; break; }
+            }
+            if (!current) {
+              ++editor->_replacementDiscards;
+              if (editor.replacementProgress == progress) {
+                editor.replacementProgress = nil;
+                [editor setFindStatus:@"本文・検索条件・選択位置・ペインの表示設定が変わったため置換を中止しました。"];
+              }
+            } else {
+              editor.replacementProgress = nil;
+              auto* prepared = payload->get();
+              if (error != nil || prepared == nullptr) [editor setFindStatus:error != nil ? error : @"置換を準備できませんでした。"];
+              else if (!prepared->result.valid) [editor setFindStatus:@"正規表現または置換文字列が正しくありません。"];
+              else if (!editor.sakuraDocument.documentSession.commitPreparedReplacement(*prepared))
+                [editor setFindStatus:@"本文または編集履歴が変わったため置換を中止しました。"];
+              else {
+                ++editor->_replacementCompletions;
+                const auto result = prepared->result;
+                textApplied = result.changed;
+                BOOL scopeInvalidated = NO;
+                if (!all && prepared->selectionAfter) {
+                  [editor clearRectangularSelection];
+                  editor.committedSelection = NSMakeRange(prepared->selectionAfter->location,prepared->selectionAfter->length);
+                }
+                if (!result.replacements) {
+                  if (!all && prepared->fallbackSelection) {
+                    const auto range = *prepared->fallbackSelection;
+                    [editor clearRectangularSelection]; [editor recordNavigationToOffset:range.location];
+                    editor.committedSelection = NSMakeRange(range.location,range.length);
+                    [editor rememberSearchSelection]; editor.searchMarksHidden = NO;
+                    [editor setFindStatus:@"検索文字列を選択しました。"];
+                    [editor setNeedsDisplay:YES]; [editor scrollSelectionToVisible];
+                  } else [editor setFindStatus:@"見つかりませんでした。"];
+                }
+                else if (!result.changed)
+                  [editor setFindStatus:[NSString stringWithFormat:@"%zu 件の置換対象がありました（本文の変更なし）。", result.replacements]];
+                else {
+                  textApplied = YES;
+                  const auto adoptStarted = std::chrono::steady_clock::now();
+                  for (auto& work : *layouts) {
+                    SakuraEditorView* view = work.view;
+                    if (view != nil && work.layout.matchesText(editor.sakuraDocument.documentSession.buffer()))
+                      [view adoptReplacementLayout:work];
+                  }
+                  editor->_replacementAdoptMilliseconds = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-adoptStarted).count();
+                  if (result.resultingRange) {
+                    const auto& buffer = editor.sakuraDocument.documentSession.buffer();
+                    editor.searchScopeRange = NSMakeRange(result.resultingRange->location, result.resultingRange->length);
+                    editor.searchScopeRevision = buffer.revision();
+                    if (!buffer.isEditBoundary(result.resultingRange->location) ||
+                        !buffer.isEditBoundary(result.resultingRange->location + result.resultingRange->length)) {
+                      editor.searchScopeCaptured = NO; scopeInvalidated = YES;
+                    }
+                    if (all) editor.committedSelection = [editor rangeByExpandingToEditBoundaries:editor.searchScopeRange];
+                  } else if (all) editor.committedSelection = NSMakeRange(0, 0);
+                  editNotified = YES;
+                  [editor.sakuraDocument noteEditorChange:NSChangeDone];
+                  const auto refreshStarted = std::chrono::steady_clock::now();
+                  [editor.sakuraDocument refreshEditorViews];
+                  editor->_replacementRefreshMilliseconds = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-refreshStarted).count();
+                  [editor setFindStatus:[NSString stringWithFormat:@"%zu 件置換しました。%@", result.replacements,
+                      scopeInvalidated ? @"検索範囲は境界が変わったため再指定してください。" : @""]];
+                }
+                if (!all && result.replacements) {
+                  [editor setNeedsDisplay:YES]; [editor scrollSelectionToVisible];
+                  if (!scopeInvalidated && prepared->nextSearchStart)
+                    [editor selectNextSearchMatchFrom:*prepared->nextSearchStart];
+                }
+              }
+            }
+          }
+          } catch (const std::exception&) {
+            if (editor != nil) {
+              editor.replacementProgress = nil;
+              if (textApplied && !editNotified) [editor.sakuraDocument noteEditorChange:NSChangeDone];
+              [editor setFindStatus:textApplied
+                  ? @"置換は反映済みですが画面更新に失敗しました。Undoで戻せます。"
+                  : @"置換を反映できませんでした。本文は変更していません。"];
+            }
+          }
+          if (editor != nil)
+            editor->_replacementMainMilliseconds = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-callbackStarted).count();
+          // Prepared/retired roots and redo history may be large. Release their
+          // owning unique_ptr on the serial worker, not at this main callback's end.
+          dispatch_async(replacementPreparationQueue(), ^{ payload->reset(); layouts->clear(); });
+        });
+      }
+    });
   } catch (const std::exception&) {
     [self setFindStatus:@"置換できませんでした。"];
     NSBeep();
@@ -1921,6 +2816,16 @@ NSString* syntaxRole(sakura::core::SyntaxTokenKind kind) {
 - (void)setMarkedText:(id)string
          selectedRange:(NSRange)selectedRange
        replacementRange:(NSRange)replacementRange {
+  [self cancelBracketSearchesForDocument];
+  for (SakuraEditorView* view in [self replacementAffectedViews]) {
+    if (view.hasPendingHistoryNavigation) {
+      [view cancelHistoryNavigation:nil];
+      [view setFindStatus:@"IME入力が始まったためUndo／Redoを中止しました。"];
+    }
+  }
+  if ([self hasPendingSearchNavigation] || [self hasPendingReplacement]) {
+    [self cancelSearchNavigation]; [self setFindStatus:@"IME入力が始まったため検索を中止しました。"];
+  }
   if (self.rectangularSelectionActive) {
     const NSUInteger index = [self displayIndexForLocalPoint:
         self.rectangularCurrentPoint];
@@ -2078,9 +2983,14 @@ NSString* syntaxRole(sakura::core::SyntaxTokenKind kind) {
 }
 
 - (void)insertTab:(id)sender {
-  (void)sender;
+  if (!self.hasMarkedText && !self.hasRectangularSelection && self.committedSelection.length) {
+    [self indentWithTab:sender];
+    return;
+  }
   [self insertText:@"\t" replacementRange:NSMakeRange(NSNotFound, 0)];
 }
+
+- (void)insertBacktab:(id)sender { [self unindentWithTab:sender]; }
 
 - (void)deleteBackward:(id)sender {
   (void)sender;
@@ -2274,30 +3184,261 @@ NSString* syntaxRole(sakura::core::SyntaxTokenKind kind) {
 
 - (void)undo:(id)sender {
   (void)sender;
-  [self clearMarkedState];
-  [self clearRectangularSelection];
-  if (self.sakuraDocument.documentSession.undo()) {
-    self.committedSelection =
-        clampedRange(self.committedSelection, [self committedString].length);
-    [self.sakuraDocument noteEditorChange:NSChangeUndone];
-    [self.sakuraDocument refreshEditorViews];
-  }
+  [self enqueueHistoryDirection:sakura::core::EditEngine::HistoryDirection::undo];
 }
 
 - (void)redo:(id)sender {
   (void)sender;
-  [self clearMarkedState];
-  [self clearRectangularSelection];
-  if (self.sakuraDocument.documentSession.redo()) {
-    self.committedSelection =
-        clampedRange(self.committedSelection, [self committedString].length);
-    [self.sakuraDocument noteEditorChange:NSChangeRedone];
-    [self.sakuraDocument refreshEditorViews];
+  [self enqueueHistoryDirection:sakura::core::EditEngine::HistoryDirection::redo];
+}
+
+- (BOOL)hasPendingHistoryNavigation {
+  return self.historyProgress != nil || !_historyRequests.empty();
+}
+- (void)cancelHistoryNavigation:(id)sender {
+  (void)sender;
+  ++_historyCancellationGeneration;
+  [self.historyProgress cancel]; self.historyProgress = nil;
+  _historyRequests.clear();
+}
+- (void)enqueueHistoryDirection:(sakura::core::EditEngine::HistoryDirection)direction {
+  [self cancelSearchNavigation]; // Also cancels a prepared replacement, even with no usable history.
+  [self cancelBracketSearch];
+  [self.searchCountProgress cancel]; self.searchCountProgress = nil;
+  [self cancelSearchHighlights];
+  SakuraDocument* document = self.sakuraDocument;
+  if (!document || document.closingDocument || self.historyWindowClosed) return;
+  for (SakuraEditorView* view in [self replacementAffectedViews]) {
+    if (view != self && view.hasMarkedText) {
+      [self setFindStatus:@"別のペインでIME入力中です。確定してからUndo／Redoを実行してください。"];
+      return;
+    }
+  }
+  if (_historyRequests.size() >= 256) {
+    [self setFindStatus:@"Undo／Redoの待機上限です。完了後に再操作してください。"];
+    return;
+  }
+  [self clearMarkedState]; [self clearRectangularSelection];
+  _historyRequests.push_back(direction);
+  [self startNextHistoryNavigation];
+}
+
+- (void)startNextHistoryNavigation {
+  NSProgress* startingProgress = nil;
+  const auto cancellationGenerationAtStart = _historyCancellationGeneration;
+  auto failToStart = [&] {
+    [startingProgress cancel];
+    // A capture/status callback may cancel this request and start a new one.
+    // Retire only this invocation, not that newer request or its status.
+    if (_historyCancellationGeneration != cancellationGenerationAtStart ||
+        (self.historyProgress && self.historyProgress != startingProgress)) return;
+    [self cancelHistoryNavigation:nil];
+    @try {
+      try { [self setFindStatus:@"Undo／Redoを開始できませんでした。本文と履歴は変更していません。"]; }
+      catch (...) {}
+    } @catch (NSException* statusException) { (void)statusException; }
+  };
+  @try {
+  if (self.historyProgress || self.applyingHistoryTransition || _historyRequests.empty()) return;
+  SakuraDocument* document = self.sakuraDocument;
+  if (!document || document.closingDocument || self.historyWindowClosed) {
+    [self cancelHistoryNavigation:nil]; return;
+  }
+  using Direction = sakura::core::EditEngine::HistoryDirection;
+  bool skipped = false;
+  while (!_historyRequests.empty()) {
+    const auto direction = _historyRequests.front();
+    if (direction == Direction::undo ? document.documentSession.canUndo() : document.documentSession.canRedo()) break;
+    _historyRequests.pop_front(); skipped = true;
+  }
+  if (_historyRequests.empty()) {
+    if (skipped) [self setFindStatus:@"対象のUndo／Redo履歴がありません。"];
+    return;
+  }
+  try {
+    const auto direction = _historyRequests.front();
+    const auto gate = [self historyWorkGate];
+    const auto seconds = [self historyPreparationTimeLimit];
+    if (!std::isfinite(seconds) || seconds <= 0 || seconds > 60)
+      throw std::invalid_argument("invalid history time limit");
+    auto layouts = std::make_shared<std::vector<ReplacementViewLayout>>();
+    for (SakuraEditorView* view in [self replacementAffectedViews]) {
+      if (view.sakuraDocument != document) {
+        [self cancelHistoryNavigation:nil];
+        [self setFindStatus:@"ペインの文書が変わったためUndo／Redoを中止しました。"];
+        return;
+      }
+      if (view.hasMarkedText) {
+        [self cancelHistoryNavigation:nil];
+        [self setFindStatus:@"IME入力中のためUndo／Redoを中止しました。"];
+        return;
+      }
+      layouts->push_back([view captureReplacementLayout]);
+    }
+    const auto source = std::make_shared<const sakura::core::EditEngine::HistorySnapshot>(
+        document.documentSession.historySnapshot());
+    const auto selectionGeneration = self.selectionGeneration;
+    const NSRange expectedSelection = self.committedSelection;
+    __weak NSWindow* expectedWindow = self.window;
+    const BOOL hadWindow = self.window != nil;
+    __weak SakuraDocument* expectedDocument = document;
+    NSProgress* progress = [NSProgress progressWithTotalUnitCount:1];
+    if (self.historyProgress || _historyCancellationGeneration != cancellationGenerationAtStart) return;
+    startingProgress = progress;
+    self.historyProgress = progress;
+    [self setFindStatus:direction == Direction::undo
+        ? @"元に戻す準備中…（⌘.／Escapeで中止）" : @"やり直す準備中…（⌘.／Escapeで中止）"];
+    auto payload = std::make_shared<std::unique_ptr<sakura::core::EditEngine::PreparedHistory>>();
+    __weak SakuraEditorView* weakSelf = self;
+    dispatch_async(replacementPreparationQueue(), ^{
+      @autoreleasepool {
+        NSString* error = nil;
+        const BOOL ranOnMain = NSThread.isMainThread;
+        @try {
+          try {
+            const auto deadline = std::chrono::steady_clock::now()+
+                std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(seconds));
+            if (gate) gate();
+            const std::function<bool()> cancelled = [progress,deadline] {
+              return progress.cancelled || std::chrono::steady_clock::now()>=deadline;
+            };
+            *payload = std::make_unique<sakura::core::EditEngine::PreparedHistory>(
+                sakura::app::DocumentSession::prepareHistory(*source,direction,cancelled));
+            if ((*payload)->hasChanges()) for (auto& work : *layouts) {
+              if (cancelled()) throw std::runtime_error("history layout cancelled");
+              sakura::platform::mac::CoreTextMetrics metrics(work.fontName,work.pointSize,work.characterSpacing);
+              const sakura::core::FontStyle style{0,work.pointSize,400,false};
+              float wrap = 0;
+              if (work.wrapMode == SakuraEditorWrapModeWindow)
+                wrap = std::max(1.0F,static_cast<float>(work.viewportWidth-kGutterWidth-2*kHorizontalInset));
+              else if (work.wrapMode == SakuraEditorWrapModeColumn)
+                wrap = metrics.advance(u' ',style)*work.wrapColumn;
+              work.layout.update((*payload)->resultingBuffer(),metrics,style,
+                  {.wrapWidth=wrap,.tabWidth=static_cast<sakura::core::TextOffset>(work.tabWidth)},
+                  work.metricsRevision,cancelled);
+            }
+          } catch (const std::exception&) {
+            error = @"Undo／Redoを中止しました（時間上限・表示準備エラー）。本文と履歴は変更していません。";
+          }
+        } @catch (NSException* exception) {
+          (void)exception;
+          error = @"Undo／Redoの表示を準備できませんでした。本文と履歴は変更していません。";
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+          SakuraEditorView* editor = weakSelf;
+          const auto callbackStarted = std::chrono::steady_clock::now();
+          SakuraDocument* liveDocument = expectedDocument;
+          BOOL applied = NO, notified = NO, continueQueue = NO;
+          auto reportFailure = [&] {
+            if (!editor) return;
+            [editor cancelHistoryNavigation:nil];
+            editor.applyingHistoryTransition = NO;
+            if (applied && !notified) {
+              notified = YES;
+              [liveDocument noteEditorChange:direction == Direction::undo ? NSChangeUndone : NSChangeRedone];
+            }
+            [editor setFindStatus:applied
+                ? @"Undo／Redoは反映済みですが画面更新に失敗しました。履歴は保持されています。"
+                : @"Undo／Redoを反映できませんでした。本文と履歴は変更していません。"];
+          };
+          @try {
+            try {
+              if (editor) {
+                editor->_historyWorkerRanOnMainThread = ranOnMain;
+                bool current = editor.historyProgress == progress && !progress.cancelled &&
+                    liveDocument && editor.sakuraDocument == liveDocument &&
+                    !liveDocument.closingDocument && !editor.historyWindowClosed &&
+                    !editor.hasRectangularSelection &&
+                    (!hadWindow || (expectedWindow && editor.window == expectedWindow)) &&
+                    editor.selectionGeneration == selectionGeneration &&
+                    NSEqualRanges(editor.committedSelection,expectedSelection);
+                const auto currentViews = current ? [editor replacementAffectedViews] : nil;
+                current = current && currentViews.count == layouts->size();
+                if (current) for (const auto& work : *layouts) {
+                  SakuraEditorView* view = work.view;
+                  if (!view || view.sakuraDocument != liveDocument || ![currentViews containsObject:view] || view.hasMarkedText ||
+                      ![[view layoutConfigurationKey] isEqual:work.key]) { current = false; break; }
+                }
+                if (!current) {
+                  ++editor->_historyDiscards;
+                  if (editor.historyProgress == progress) {
+                    [editor cancelHistoryNavigation:nil];
+                    [editor setFindStatus:@"本文・選択・IME・ペイン表示が変わったためUndo／Redoを中止しました。"];
+                  }
+                } else if (error || !*payload) {
+                  [editor cancelHistoryNavigation:nil];
+                  [editor setFindStatus:error ? error : @"Undo／Redoを準備できませんでした。"];
+                } else if (!liveDocument.documentSession.commitPreparedHistory(**payload)) {
+                  ++editor->_historyDiscards;
+                  [editor cancelHistoryNavigation:nil];
+                  [editor setFindStatus:@"本文または編集履歴が変わったためUndo／Redoを中止しました。"];
+                } else {
+                  editor.historyProgress = nil;
+                  if (!editor->_historyRequests.empty()) editor->_historyRequests.pop_front();
+                  ++editor->_historyCompletions;
+                  applied = (*payload)->hasChanges();
+                  const auto cancellationGeneration = editor->_historyCancellationGeneration;
+                  editor.applyingHistoryTransition = YES;
+                  if (applied) {
+                    const auto adoptStarted = std::chrono::steady_clock::now();
+                    for (auto& work : *layouts) {
+                      SakuraEditorView* view = work.view;
+                      [view adoptPreparedLayout:work]; ++view->_historyLayoutsAdopted;
+                    }
+                    editor->_historyAdoptMilliseconds = std::chrono::duration<double,std::milli>(
+                        std::chrono::steady_clock::now()-adoptStarted).count();
+                    NSRange selection = clampedRange(editor.committedSelection,
+                        liveDocument.documentSession.buffer().length());
+                    if (selection.length) selection = [editor rangeByExpandingToEditBoundaries:selection];
+                    else selection.location = [editor previousEditBoundaryAtOrBefore:selection.location];
+                    [editor updateCommittedSelection:selection preservingHistory:YES];
+                    notified = YES;
+                    [liveDocument noteEditorChange:direction == Direction::undo ? NSChangeUndone : NSChangeRedone];
+                    const auto refreshStarted = std::chrono::steady_clock::now();
+                    [liveDocument refreshEditorViews];
+                    editor->_historyRefreshMilliseconds = std::chrono::duration<double,std::milli>(
+                        std::chrono::steady_clock::now()-refreshStarted).count();
+                  }
+                  editor.applyingHistoryTransition = NO;
+                  const auto& live = liveDocument.documentSession.buffer();
+                  const auto& published = (*payload)->resultingBuffer();
+                  if (editor->_historyCancellationGeneration != cancellationGeneration ||
+                      editor.sakuraDocument != liveDocument || liveDocument.closingDocument ||
+                      (applied && (live.revision() != published.revision() || !live.sharesStorageWith(published)))) {
+                    [editor cancelHistoryNavigation:nil];
+                    [editor setFindStatus:@"Undo／Redoは反映済みです。操作状態が変わったため、残りの履歴操作を中止しました。"];
+                  } else {
+                    if (applied) [editor setFindStatus:direction == Direction::undo ? @"元に戻しました。" : @"やり直しました。"];
+                    continueQueue = YES;
+                  }
+                }
+              }
+            } catch (const std::exception&) { reportFailure(); }
+          } @catch (NSException* exception) { (void)exception; reportFailure(); }
+          if (editor) editor->_historyMainMilliseconds = std::chrono::duration<double,std::milli>(
+              std::chrono::steady_clock::now()-callbackStarted).count();
+          // Retired history/text/layout roots outlive publication and are freed
+          // on the worker, before it starts preparing the next queued request.
+          dispatch_async(replacementPreparationQueue(), ^{ payload->reset(); layouts->clear(); });
+          if (continueQueue && editor) [editor startNextHistoryNavigation];
+        });
+      }
+    });
+  } catch (...) { failToStart(); }
+  } @catch (NSException* exception) {
+    (void)exception;
+    failToStart();
   }
 }
 
+- (std::function<void()>)historyWorkGate { return {}; } // Deterministic worker gating in isolated UI tests only.
+- (NSTimeInterval)historyPreparationTimeLimit { return 5.0; }
+
 - (void)cancelOperation:(id)sender {
   (void)sender;
+  if ([self hasPendingSearchNavigation] || [self hasPendingReplacement] || [self hasPendingHistoryNavigation] ||
+      [self hasPendingBracketSearch] || self.searchCountProgress) [self cancelSearchOperations:nil];
+  [self cancelSyntaxHighlighting:nil];
   [self clearMarkedState];
   [self clearRectangularSelection];
   [self updateDocumentViewSize];
@@ -2732,11 +3873,14 @@ NSString* syntaxRole(sakura::core::SyntaxTokenKind kind) {
 
 - (BOOL)validateUserInterfaceItem:(id<NSValidatedUserInterfaceItem>)item {
   const SEL action = item.action;
+  if (action == @selector(cancelSearchOperations:))
+    return [self hasPendingSearchNavigation] || [self hasPendingHistoryNavigation] || [self hasPendingBracketSearch] ||
+        self.searchCountProgress != nil || self.searchHighlightProgress != nil;
   if (action == @selector(undo:)) {
-    return self.sakuraDocument.documentSession.canUndo();
+    return [self hasPendingHistoryNavigation] || self.sakuraDocument.documentSession.canUndo();
   }
   if (action == @selector(redo:)) {
-    return self.sakuraDocument.documentSession.canRedo();
+    return [self hasPendingHistoryNavigation] || self.sakuraDocument.documentSession.canRedo();
   }
   if (action == @selector(copy:) || action == @selector(cut:)) {
     return [self selectedCharacterCount] != 0;

@@ -42,6 +42,7 @@ struct LayoutOptions {
   // A non-positive value disables soft wrapping.
   float wrapWidth{};
   TextOffset tabWidth{4};
+  friend constexpr bool operator==(const LayoutOptions&, const LayoutOptions&) = default;
 };
 
 struct VisualLine {
@@ -71,6 +72,10 @@ class LayoutEngine {
                                     const ITextMetrics& metrics,
                                     const FontStyle& style,
                                     const LayoutOptions& options) const;
+  [[nodiscard]] LayoutResult layoutLines(const TextBuffer& buffer,
+      std::size_t firstLine, std::size_t lineCount, const ITextMetrics& metrics,
+      const FontStyle& style, const LayoutOptions& options,
+      const std::function<bool()>& cancelled = {}) const;
 };
 
 }  // namespace sakura::core

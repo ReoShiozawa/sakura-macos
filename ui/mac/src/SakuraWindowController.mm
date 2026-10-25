@@ -7,6 +7,9 @@
 #import "SakuraColorTheme.h"
 #import "SakuraEditorView.h"
 #import "SakuraEditorSettings.h"
+#import "SakuraSyntaxSettings.h"
+#import "SakuraKeywordFile.h"
+#import "SakuraRecoveryStore.h"
 
 #include <algorithm>
 #include <cmath>
@@ -18,6 +21,7 @@
 
 #include "sakura/core/encoding/EncodingService.h"
 #include "sakura/core/encoding/Utf8Codec.h"
+#include "sakura/core/syntax/SyntaxHighlighter.h"
 #include "sakura/platform/mac/MacEncodingService.h"
 #include "sakura/platform/mac/GrepFileTransaction.h"
 #include "sakura/platform/mac/StringBridge.h"
@@ -38,6 +42,12 @@ struct GrepReplacementCandidate {
 };
 
 constexpr std::size_t kGrepPreviewMemoryLimit = 128ULL * 1024ULL * 1024ULL;
+
+NSArray<NSNumber*>* grepIdentityValues(const sakura::platform::mac::GrepFileIdentity& identity) {
+  return @[@(identity.device), @(identity.inode), @(identity.mode), @(identity.size),
+      @(identity.modificationSeconds), @(identity.modificationNanoseconds),
+      @(identity.changeSeconds), @(identity.changeNanoseconds)];
+}
 
 NSString* stringFromUtf8(std::string_view value) {
   NSString* string = [[NSString alloc] initWithBytes:value.data()
@@ -60,12 +70,17 @@ NSArray<NSString*>* grepPatternsFromString(NSString* value) {
 }
 
 BOOL grepFileNameMatches(NSString* name, NSArray<NSString*>* patterns) {
+  BOOL included = NO, hasInclude = NO;
   for (NSString* pattern in patterns) {
+    BOOL exclude = [pattern hasPrefix:@"!"];
+    NSString* wildcard = exclude ? [pattern substringFromIndex:1] : pattern;
     NSPredicate* predicate = [NSPredicate predicateWithFormat:@"SELF LIKE[c] %@",
-                                                        pattern];
-    if ([predicate evaluateWithObject:name]) return YES;
+                                                        wildcard];
+    BOOL matches = [predicate evaluateWithObject:name];
+    if (exclude && matches) return NO;
+    if (!exclude) { hasInclude = YES; included |= matches; }
   }
-  return NO;
+  return !hasInclude || included;
 }
 
 // A single component applies at every depth. A path is rooted at the selected
@@ -288,10 +303,25 @@ NSView* toolbarSeparator() {
 @property(nonatomic, strong, nullable) NSTextField* typeDisplayResetStatus;
 @property(nonatomic, copy, nullable) NSDictionary<NSString*, id>* typeDisplayBaselineValues;
 @property(nonatomic) BOOL typeDisplayResetPending;
+@property(nonatomic, strong) NSTextView* typeKeywordText;
+@property(nonatomic, strong) NSTextView* typePatternText;
+@property(nonatomic, strong) NSButton* typeSyntaxCaseButton;
+@property(nonatomic, strong) NSTextField* typeSyntaxStatus;
+@property(nonatomic, copy) NSDictionary* typeSyntaxBaseline;
+@property(nonatomic) BOOL typeSettingsApplySucceeded;
+@property(nonatomic, strong) NSPopUpButton* typeSyntaxGroupPopup;
+@property(nonatomic, strong) NSMutableArray<NSDictionary*>* typeSyntaxDraftGroups;
+@property(nonatomic) NSInteger typeSyntaxGroupIndex;
+@property(nonatomic) NSUInteger typeSyntaxSession;
+@property(nonatomic, strong) NSTabView* typeSettingsTabs;
 @property(nonatomic, strong, nullable) NSPanel* commonSettingsPanel;
 @property(nonatomic, strong, nullable) NSTextField* commonFontSizeField;
 @property(nonatomic, strong, nullable) NSTextField* commonTabWidthField;
 @property(nonatomic, strong, nullable) NSPopUpButton* commonThemePopup;
+@property(nonatomic, strong) NSTextField* commonRecoveryGenerationsField;
+@property(nonatomic, strong) NSTextField* commonRecoveryBudgetField;
+@property(nonatomic, strong) NSTextField* commonRecoveryStatus;
+@property(nonatomic) BOOL commonSettingsApplySucceeded;
 @property(nonatomic, strong, nullable) NSPanel* encodingPanel;
 @property(nonatomic, strong, nullable) NSPopUpButton* encodingPopup;
 @property(nonatomic, strong, nullable) NSButton* encodingBomCheckbox;
@@ -306,6 +336,8 @@ NSView* toolbarSeparator() {
 @property(nonatomic, strong, nullable) NSButton* grepCaseSensitiveButton;
 @property(nonatomic, strong, nullable) NSButton* grepRegexButton;
 @property(nonatomic, strong, nullable) NSButton* grepRecursiveButton;
+@property(nonatomic, strong, nullable) NSButton* grepWholeWordButton;
+@property(nonatomic, strong, nullable) NSPopUpButton* grepEncodingPopup;
 @property(nonatomic, strong, nullable) NSTableView* grepTableView;
 @property(nonatomic, strong, nullable) NSTextField* grepStatusLabel;
 @property(nonatomic, strong, nullable) NSButton* grepRunButton;
@@ -619,6 +651,8 @@ NSView* toolbarSeparator() {
   } else {
     [label setContentHuggingPriority:NSLayoutPriorityDefaultLow
                       forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [label setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow
+                                   forOrientation:NSLayoutConstraintOrientationHorizontal];
   }
   return label;
 }
@@ -635,7 +669,9 @@ NSView* toolbarSeparator() {
   stack.orientation = NSUserInterfaceLayoutOrientationHorizontal;
   stack.alignment = NSLayoutAttributeCenterY;
   stack.spacing = 5.0;
-  stack.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+  // Status text must truncate within the chrome, never grow the window and
+  // invalidate a viewport-dependent operation just by reporting its progress.
+  stack.translatesAutoresizingMaskIntoConstraints = NO;
   self.statusMessage = [self statusLabel:@"" width:0.0];
   self.statusMessage.alignment = NSTextAlignmentLeft;
   self.statusPosition = [self statusLabel:@"1 行 1 桁" width:108.0];
@@ -655,6 +691,12 @@ NSView* toolbarSeparator() {
     [stack addArrangedSubview:label];
   }
   [background addSubview:stack];
+  [NSLayoutConstraint activateConstraints:@[
+    [stack.leadingAnchor constraintEqualToAnchor:background.leadingAnchor constant:4.0],
+    [stack.trailingAnchor constraintEqualToAnchor:background.trailingAnchor constant:-4.0],
+    [stack.topAnchor constraintEqualToAnchor:background.topAnchor constant:2.0],
+    [stack.bottomAnchor constraintEqualToAnchor:background.bottomAnchor constant:-2.0]
+  ]];
   NSBox* top = [[NSBox alloc]
       initWithFrame:NSMakeRect(0, NSHeight(frame) - 1, NSWidth(frame), 1)];
   top.boxType = NSBoxSeparator;
@@ -905,11 +947,17 @@ NSView* toolbarSeparator() {
 }
 
 - (void)saveDocument:(id)sender {
+  [(SakuraDocument*)self.document commitPendingInput];
   [self.document saveDocument:sender];
 }
 
 - (void)saveDocumentAs:(id)sender {
+  [(SakuraDocument*)self.document commitPendingInput];
   [self.document saveDocumentAs:sender];
+}
+
+- (void)saveAndClose:(id)sender {
+  [(SakuraDocument*)self.document saveAndClose:sender];
 }
 
 - (SakuraEditorView*)activeEditor {
@@ -1009,6 +1057,9 @@ NSView* toolbarSeparator() {
                   to:[self activeEditor]
                 from:sender];
 }
+- (void)cancelSearchOperations:(id)sender {
+  [NSApp sendAction:@selector(cancelSearchOperations:) to:[self activeEditor] from:sender];
+}
 
 - (NSUserDefaults*)grepDefaults {
   return NSUserDefaults.standardUserDefaults;
@@ -1023,7 +1074,9 @@ NSView* toolbarSeparator() {
       self.grepReplaceMode ? (self.grepReplacementField.stringValue ?: @"") : @"",
       @(self.grepCaseSensitiveButton.state == NSControlStateValueOn),
       @(self.grepRegexButton.state == NSControlStateValueOn),
-      @(self.grepRecursiveButton.state == NSControlStateValueOn)];
+      @(self.grepRecursiveButton.state == NSControlStateValueOn),
+      @(self.grepWholeWordButton.state == NSControlStateValueOn),
+      @([self.grepEncodingPopup.selectedItem.representedObject integerValue])];
   NSData* serialized = [NSJSONSerialization dataWithJSONObject:values options:0 error:nil];
   return [[NSString alloc] initWithData:serialized encoding:NSUTF8StringEncoding];
 }
@@ -1042,6 +1095,8 @@ NSView* toolbarSeparator() {
 }
 
 - (void)setGrepControlsEnabled:(BOOL)enabled {
+  self.grepWholeWordButton.enabled = enabled;
+  self.grepEncodingPopup.enabled = enabled;
   for (NSControl* control in @[
       self.grepQueryField, self.grepReplacementField, self.grepFolderField,
       self.grepPatternField, self.grepExcludedFolderField,
@@ -1143,6 +1198,10 @@ NSView* toolbarSeparator() {
 
   NSArray<NSString*>* patterns = grepPatternsFromString(
       self.grepPatternField.stringValue);
+  if ([patterns containsObject:@"!"]) {
+    self.grepStatusLabel.stringValue = @"! の後に除外するファイル名パターンを指定してください。";
+    return;
+  }
   NSString* excludedFolderText = [self.grepExcludedFolderField.stringValue copy] ?: @"";
   NSString* exclusionError = nil;
   NSArray<NSDictionary*>* folderExclusions = grepFolderExclusionsFromString(
@@ -1163,10 +1222,17 @@ NSView* toolbarSeparator() {
                                  NSControlStateValueOn;
   const BOOL recursive = self.grepRecursiveButton.state ==
                          NSControlStateValueOn;
+  const BOOL wholeWord = self.grepWholeWordButton.state == NSControlStateValueOn;
+  const NSInteger encodingValue = [self.grepEncodingPopup.selectedItem.representedObject integerValue];
+  if (encodingValue < 0 || encodingValue > 6) {
+    self.grepStatusLabel.stringValue = @"検索文字コードが不正です。";
+    return;
+  }
+  const auto inputEncoding = static_cast<sakura::core::TextEncoding>(encodingValue);
   const auto needle = sakura::platform::mac::sakuraStringFromString(query);
   const sakura::core::SearchOptions searchOptions{
       .caseSensitive = static_cast<bool>(caseSensitive),
-      .wholeWord = false, .wrap = false,
+      .wholeWord = static_cast<bool>(wholeWord), .wrap = false,
       .regularExpression = static_cast<bool>(regularExpression)};
   if (!sakura::core::SearchEngine{}.isValidPattern(needle, searchOptions)) {
     self.grepStatusLabel.stringValue = @"正規表現が正しくありません。";
@@ -1174,6 +1240,8 @@ NSView* toolbarSeparator() {
     return;
   }
   [[self grepDefaults] setObject:excludedFolderText forKey:@"SakuraGrepExcludedFolders"];
+  [[self grepDefaults] setInteger:encodingValue forKey:@"SakuraGrepEncoding"];
+  [[self grepDefaults] setBool:wholeWord forKey:@"SakuraGrepWholeWord"];
   const BOOL replaceMode = self.grepReplaceMode;
   const auto replacement = sakura::platform::mac::sakuraStringFromString(
       self.grepReplacementField.stringValue);
@@ -1200,11 +1268,13 @@ NSView* toolbarSeparator() {
       NSUInteger filesScanned = 0;
       NSUInteger resultCount = 0;
       NSUInteger errors = 0;
+      NSUInteger oversized = 0, binaryFiles = 0, ambiguousMatches = 0;
       std::size_t retainedBytes = 0;
       BOOL limitReached = NO;
       BOOL memoryLimitReached = NO;
       auto cancellableOptions = searchOptions;
       cancellableOptions.maxMatches = 20001;
+      cancellableOptions.captureGroups = false;
       cancellableOptions.cancelled = [progress]() {
         return static_cast<bool>(progress.cancelled);
       };
@@ -1221,20 +1291,25 @@ NSView* toolbarSeparator() {
         if (!grepFileNameMatches(url.lastPathComponent, patterns)) return true;
         const unsigned long long fileSize = [attributes[NSFileSize]
             unsignedLongLongValue];
-        if (fileSize > 32ULL * 1024ULL * 1024ULL) return true;
+        if (fileSize > 32ULL * 1024ULL * 1024ULL) { ++oversized; return true; }
         ++filesScanned;
         auto read = sakura::platform::mac::readGrepFileSnapshot(
             path, 32ULL * 1024ULL * 1024ULL);
         if (!read.snapshot.has_value()) { ++errors; return true; }
         const auto& bytes = read.snapshot->bytes;
         NSData* data = [NSData dataWithBytes:bytes.data() length:bytes.size()];
-        if (grepDataLooksBinary(data)) return true;
+        const bool explicitUtf16 = inputEncoding == sakura::core::TextEncoding::utf16LittleEndian ||
+            inputEncoding == sakura::core::TextEncoding::utf16BigEndian;
+        if (!explicitUtf16 && grepDataLooksBinary(data)) { ++binaryFiles; return true; }
         sakura::app::DocumentSession session(
             sakura::platform::mac::macEncodingService());
-        if (!session.load(bytes).ok()) { ++errors; return true; }
+        if (!session.load(bytes, inputEncoding).ok()) { ++errors; return true; }
         const auto& buffer = session.buffer();
+        NSArray<NSNumber*>* identity = grepIdentityValues(read.snapshot->identity);
         cancellableOptions.maxMatches = 20001 - resultCount;
         const auto matches = session.findAll(needle, cancellableOptions);
+        const bool ambiguousEncoding = session.sourceEncodingDetection().ambiguous;
+        if (ambiguousEncoding && !matches.empty()) ++ambiguousMatches;
         for (const auto& match : matches) {
           if (progress.cancelled) break;
           const auto position = buffer.positionAt(match.range.location);
@@ -1263,10 +1338,15 @@ NSView* toolbarSeparator() {
           NSString* title = [NSString stringWithFormat:@"%@:%zu:%llu: %@",
               relativePath, position.line + 1,
               static_cast<unsigned long long>(position.column + 1), preview];
+          if (ambiguousEncoding) title = [title stringByAppendingString:@"  [文字コード要確認]"];
           [batch addObject:@{
             @"title" : title,
             @"url" : url,
             @"offset" : @(static_cast<unsigned long long>(match.range.location)),
+            @"encoding" : @(static_cast<NSInteger>(session.encodingState().encoding)),
+            @"requestedEncoding" : @(static_cast<NSInteger>(inputEncoding)),
+            @"ambiguousEncoding" : @(ambiguousEncoding),
+            @"identity" : identity,
           }];
           ++resultCount;
           if (batch.count >= 100) {
@@ -1283,6 +1363,10 @@ NSView* toolbarSeparator() {
         }
         if (replaceMode && !matches.empty() && !limitReached &&
             !progress.cancelled) {
+          // Never turn a guessed Japanese interpretation into a bulk write.
+          // Keep search results visible, but require an explicit encoding and
+          // a fresh preview before allowing any of this batch to be committed.
+          if (ambiguousEncoding) return true;
           const std::size_t remaining = kGrepPreviewMemoryLimit - retainedBytes;
           if (bytes.size() >= remaining) {
             memoryLimitReached = YES;
@@ -1342,13 +1426,15 @@ NSView* toolbarSeparator() {
                   (unsigned long)controller.grepResults.count];
         } else {
           controller.grepStatusLabel.stringValue = [NSString
-              stringWithFormat:@"%luファイル、%lu件／読込・変換エラー%lu",
+              stringWithFormat:@"%luファイル、%lu件／読込・変換エラー%lu・大容量除外%lu・バイナリ%lu・文字コード要確認%lu%@",
                   (unsigned long)filesScanned,
                   (unsigned long)controller.grepResults.count,
-                  (unsigned long)errors];
+                  (unsigned long)errors, (unsigned long)oversized, (unsigned long)binaryFiles,
+                  (unsigned long)ambiguousMatches,
+                  replaceMode && ambiguousMatches ? @"（文字コードを指定して再検索してください）" : @""];
         }
         controller.grepPreviewReady = replaceMode && !limitReached &&
-            !memoryLimitReached && !progress.cancelled && errors == 0 &&
+            !memoryLimitReached && !progress.cancelled && errors == 0 && oversized == 0 && ambiguousMatches == 0 &&
             !candidates->empty();
         if (!controller.grepPreviewReady) {
           candidates->clear();
@@ -1430,6 +1516,7 @@ NSView* toolbarSeparator() {
         NSUInteger filesSkipped = 0;
         NSUInteger conflicts = 0;
         NSUInteger errors = 0;
+        BOOL synchronizationFailed = NO;
         NSMutableArray<NSDictionary*>* outcomes = [NSMutableArray array];
         for (const auto& candidate : *candidates) {
           if (progress.cancelled) break;
@@ -1464,6 +1551,13 @@ NSView* toolbarSeparator() {
               replacementsMade += candidate.replacements;
               outcome = @"置換完了";
               break;
+            case sakura::platform::mac::GrepCommitStatus::writtenNotDurable:
+              ++filesChanged;
+              replacementsMade += candidate.replacements;
+              ++errors;
+              synchronizationFailed = YES;
+              outcome = @"変更反映済み・ディスク同期失敗（バックアップを確認してください）";
+              break;
             case sakura::platform::mac::GrepCommitStatus::conflict:
               ++conflicts;
               outcome = @"変更競合のためスキップ";
@@ -1482,6 +1576,7 @@ NSView* toolbarSeparator() {
           NSString* title = [NSString stringWithFormat:@"%@: %@%@%@", outcome,
               url.path, detail.length ? @" — " : @"", detail];
           [outcomes addObject:@{@"title": title, @"url": url, @"offset": @0}];
+          if (synchronizationFailed) break;
         }
 
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -1494,7 +1589,11 @@ NSView* toolbarSeparator() {
           [finished.grepResults addObjectsFromArray:outcomes];
           [finished.grepTableView reloadData];
           finished.grepPreviewSignature = nil;
-          if (progress.cancelled) {
+          if (synchronizationFailed) {
+            finished.grepStatusLabel.stringValue = [NSString stringWithFormat:
+                @"ディスク同期失敗で停止（%luファイル、%lu件は変更反映済み）。バックアップを確認してください。",
+                (unsigned long)filesChanged, (unsigned long)replacementsMade];
+          } else if (progress.cancelled) {
             finished.grepStatusLabel.stringValue = [NSString
                 stringWithFormat:@"中止（%luファイル、%lu件置換）",
                     (unsigned long)filesChanged,
@@ -1514,6 +1613,33 @@ NSView* toolbarSeparator() {
   }];
 }
 
+- (NSString*)grepResultText {
+  NSMutableString* output = [NSMutableString stringWithFormat:@"# Sakura Grep\n# %@\n", self.grepStatusLabel.stringValue];
+  for (NSDictionary* result in self.grepResults) [output appendFormat:@"%@\n", result[@"title"]];
+  return output;
+}
+
+- (void)exportGrepResults:(id)sender {
+  (void)sender;
+  NSString* text = [self grepResultText]; // Freeze results before presenting the panel.
+  NSSavePanel* panel = NSSavePanel.savePanel;
+  panel.nameFieldStringValue = @"grep-results.txt";
+  [panel beginSheetModalForWindow:self.grepPanel completionHandler:^(NSModalResponse response) {
+    if (response != NSModalResponseOK) return;
+    NSError* error = nil;
+    if (![text writeToURL:panel.URL atomically:YES encoding:NSUTF8StringEncoding error:&error])
+      [NSApp presentError:error];
+  }];
+}
+
+- (BOOL)grepResultIsCurrent:(NSDictionary*)result {
+  NSURL* url = result[@"url"];
+  if (![url isKindOfClass:NSURL.class] || !url.isFileURL || !result[@"identity"]) return NO;
+  const auto read = sakura::platform::mac::readGrepFileSnapshot(
+      std::filesystem::path(url.path.fileSystemRepresentation), 32ULL * 1024 * 1024);
+  return read.snapshot && [result[@"identity"] isEqual:grepIdentityValues(read.snapshot->identity)];
+}
+
 - (void)grepSelectionActivated:(id)sender {
   (void)sender;
   const NSInteger row = self.grepTableView.selectedRow;
@@ -1522,6 +1648,10 @@ NSView* toolbarSeparator() {
     return;
   }
   NSDictionary* result = self.grepResults[static_cast<NSUInteger>(row)];
+  if (![self grepResultIsCurrent:result]) {
+    self.grepStatusLabel.stringValue = @"検索後にファイルが変更されました。再検索してください。";
+    return;
+  }
   NSURL* url = result[@"url"];
   const NSUInteger offset = [result[@"offset"] unsignedIntegerValue];
   [[NSDocumentController sharedDocumentController]
@@ -1530,9 +1660,34 @@ NSView* toolbarSeparator() {
                   completionHandler:^(NSDocument* document,
                                       BOOL documentWasAlreadyOpen,
                                       NSError* error) {
-    (void)documentWasAlreadyOpen;
     if (error != nil) {
       [NSApp presentError:error];
+      return;
+    }
+    if (![document isKindOfClass:SakuraDocument.class]) return;
+    SakuraDocument* target = (SakuraDocument*)document;
+    if (documentWasAlreadyOpen) [target commitPendingInput];
+    if (documentWasAlreadyOpen && target.isDocumentEdited) {
+      self.grepStatusLabel.stringValue = @"対象文書は編集中です。保存後に再検索してください。";
+      return;
+    }
+    if (![self grepResultIsCurrent:result]) {
+      self.grepStatusLabel.stringValue = @"検索後にファイルが変更されました。再検索してください。";
+      return;
+    }
+    auto encoding = static_cast<sakura::core::TextEncoding>([result[@"encoding"] integerValue]);
+    if (documentWasAlreadyOpen || target.documentSession.encodingState().encoding != encoding) {
+      NSError* reloadError = nil;
+      const auto requested = result[@"requestedEncoding"]
+          ? static_cast<sakura::core::TextEncoding>([result[@"requestedEncoding"] integerValue])
+          : encoding;
+      if (![target reloadUsingEncoding:requested error:&reloadError]) {
+        if (reloadError) [NSApp presentError:reloadError];
+        return;
+      }
+    }
+    if (![self grepResultIsCurrent:result]) {
+      self.grepStatusLabel.stringValue = @"読込中にファイルが変更されました。再検索してください。";
       return;
     }
     SakuraWindowController* controller = (SakuraWindowController*)
@@ -1553,7 +1708,7 @@ NSView* toolbarSeparator() {
     panel.title = @"Grep";
     panel.hidesOnDeactivate = NO;
     panel.floatingPanel = YES;
-    panel.minSize = NSMakeSize(560, 380);
+    panel.minSize = NSMakeSize(780, 420);
     NSView* content = panel.contentView;
 
     NSTextField* queryLabel = [NSTextField labelWithString:@"検索文字列:"];
@@ -1592,6 +1747,7 @@ NSView* toolbarSeparator() {
     NSTextField* pattern = [[NSTextField alloc]
         initWithFrame:NSMakeRect(100, 466, 250, 28)];
     pattern.stringValue = @"*";
+    pattern.toolTip = @"; 区切りの名前パターン。例: *.cpp;*.h;!*.generated.h。! は除外。";
     [content addSubview:pattern];
     NSButton* caseSensitive = [NSButton checkboxWithTitle:@"大文字小文字を区別"
                                                     target:nil action:nil];
@@ -1623,15 +1779,32 @@ NSView* toolbarSeparator() {
     excludedFolder.stringValue = [savedExclusions isKindOfClass:NSString.class]
         ? savedExclusions : @"";
     [content addSubview:excludedFolder];
+    NSButton* wholeWord = [NSButton checkboxWithTitle:@"単語単位" target:nil action:nil];
+    wholeWord.frame = NSMakeRect(12, 396, 100, 24);
+    wholeWord.state = [[self grepDefaults] boolForKey:@"SakuraGrepWholeWord"] ? NSControlStateValueOn : NSControlStateValueOff;
+    [content addSubview:wholeWord];
+    NSTextField* encodingLabel = [NSTextField labelWithString:@"文字コード:"];
+    encodingLabel.frame = NSMakeRect(125, 397, 84, 22);
+    [content addSubview:encodingLabel];
+    NSPopUpButton* encoding = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(210, 394, 200, 28)];
+    [encoding addItemsWithTitles:@[@"自動判定", @"UTF-8", @"UTF-16LE", @"UTF-16BE", @"CP932 (Shift_JIS)", @"EUC-JP", @"ISO-2022-JP"]];
+    for (NSUInteger i = 0; i < encoding.numberOfItems; ++i) [encoding itemAtIndex:i].representedObject = @(i);
+    NSInteger savedEncoding = [[self grepDefaults] integerForKey:@"SakuraGrepEncoding"];
+    [encoding selectItemAtIndex:std::clamp<NSInteger>(savedEncoding, 0, 6)];
+    [content addSubview:encoding];
+    NSButton* exportResults = [NSButton buttonWithTitle:@"結果を書き出す…" target:self action:@selector(exportGrepResults:)];
+    exportResults.frame = NSMakeRect(590, 394, 178, 28);
+    exportResults.autoresizingMask = NSViewMinXMargin;
+    [content addSubview:exportResults];
     for (NSView* topControl in @[
         queryLabel, query, replacementLabel, replacement, folderLabel, folderField,
         browse, patternLabel, pattern, caseSensitive, regex, recursive,
-        excludedFolderLabel, excludedFolder]) {
+        excludedFolderLabel, excludedFolder, wholeWord, encodingLabel, encoding, exportResults]) {
       topControl.autoresizingMask |= NSViewMinYMargin;
     }
 
     NSScrollView* scroll = [[NSScrollView alloc]
-        initWithFrame:NSMakeRect(12, 52, 756, 368)];
+        initWithFrame:NSMakeRect(12, 52, 756, 332)];
     scroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     scroll.hasVerticalScroller = YES;
     scroll.hasHorizontalScroller = YES;
@@ -1651,28 +1824,28 @@ NSView* toolbarSeparator() {
 
     NSButton* run = [NSButton buttonWithTitle:@"検索" target:self
                                        action:@selector(startGrep:)];
-    run.frame = NSMakeRect(12, 12, 88, 28);
+    run.frame = NSMakeRect(12, 6, 88, 24);
     run.keyEquivalent = @"\r";
     [content addSubview:run];
     NSButton* cancel = [NSButton buttonWithTitle:@"中止" target:self
                                           action:@selector(cancelGrep:)];
-    cancel.frame = NSMakeRect(212, 12, 88, 28);
+    cancel.frame = NSMakeRect(212, 6, 88, 24);
     [content addSubview:cancel];
     NSButton* replaceFiles = [NSButton buttonWithTitle:@"置換実行"
         target:self action:@selector(executeGrepReplace:)];
-    replaceFiles.frame = NSMakeRect(108, 12, 96, 28);
+    replaceFiles.frame = NSMakeRect(108, 6, 96, 24);
     replaceFiles.enabled = NO;
     [content addSubview:replaceFiles];
     NSButton* backup = [NSButton checkboxWithTitle:@"バックアップ(.bak)"
         target:nil action:nil];
-    backup.frame = NSMakeRect(310, 14, 150, 24);
+    backup.frame = NSMakeRect(310, 6, 180, 24);
     backup.state = NSControlStateValueOn;
     [content addSubview:backup];
     NSTextField* status = [NSTextField labelWithString:@""];
     status.alignment = NSTextAlignmentRight;
-    status.frame = NSMakeRect(466, 17, 302, 18);
-    status.autoresizingMask = NSViewWidthSizable | NSViewMinXMargin |
-                              NSViewMaxYMargin;
+    status.frame = NSMakeRect(12, 34, 756, 16);
+    status.font = [NSFont systemFontOfSize:11];
+    status.autoresizingMask = NSViewWidthSizable;
     [content addSubview:status];
 
     self.grepPanel = panel;
@@ -1685,6 +1858,8 @@ NSView* toolbarSeparator() {
     self.grepCaseSensitiveButton = caseSensitive;
     self.grepRegexButton = regex;
     self.grepRecursiveButton = recursive;
+    self.grepWholeWordButton = wholeWord;
+    self.grepEncodingPopup = encoding;
     self.grepTableView = table;
     self.grepStatusLabel = status;
     self.grepRunButton = run;
@@ -1735,6 +1910,25 @@ NSView* toolbarSeparator() {
   NSMutableArray<NSDictionary*>* entries = [NSMutableArray array];
   NSCharacterSet* whitespace = [NSCharacterSet whitespaceCharacterSet];
   NSString* extension = document.fileURL.pathExtension.lowercaseString;
+  using Language = sakura::core::SyntaxLanguage;
+  const auto language = sakura::core::SyntaxHighlighter::languageForExtension(extension.UTF8String != nullptr ? extension.UTF8String : "");
+  const auto tokens = sakura::core::SyntaxHighlighter{}.highlight(buffer, language);
+  std::size_t tokenCursor = 0;
+  NSString* declarationPattern = nil;
+  switch (language) {
+    case Language::python: declarationPattern = @"^(?:async\\s+)?(?:def|class)\\s+[^\\W\\d]\\w*"; break;
+    case Language::javascript: case Language::typescript:
+      declarationPattern = @"^(?:(?:export|default|async|declare|abstract)\\s+)*(?:(?:function\\s*\\*?|class|interface|enum|namespace|type)\\s+[\\w$]+|(?:const|let|var)\\s+[\\w$]+\\s*=\\s*(?:async\\s*)?(?:\\([^)]*\\)|[\\w$]+)\\s*=>)"; break;
+    case Language::ruby: declarationPattern = @"^(?:class|module|def)\\s+\\S+"; break;
+    case Language::shell: declarationPattern = @"^(?:function\\s+\\w+|\\w+\\s*\\(\\s*\\))"; break;
+    case Language::rust: declarationPattern = @"^(?:pub(?:\\([^)]*\\))?\\s+)?(?:(?:async|unsafe|const)\\s+)*(?:fn|struct|enum|trait|impl|mod|type)\\b"; break;
+    case Language::go: declarationPattern = @"^(?:func|type)\\s+"; break;
+    case Language::sql: declarationPattern = @"(?i)^create\\s+(?:or\\s+replace\\s+)?(?:table|view|function|procedure|index|trigger)\\s+"; break;
+    case Language::markdown: declarationPattern = @"^#{1,6}(?:\\s|$)"; break;
+    default: break;
+  }
+  NSRegularExpression* declaration = declarationPattern ?
+      [NSRegularExpression regularExpressionWithPattern:declarationPattern options:0 error:nil] : nil;
   const BOOL isMarkdown = [@[@"md", @"markdown", @"mdown", @"mkd"]
       containsObject:extension != nil ? extension : @""];
   NSArray<NSString*>* declarationPrefixes = @[
@@ -1749,7 +1943,18 @@ NSView* toolbarSeparator() {
   for (std::size_t lineIndex = 0; lineIndex < buffer.lineCount(); ++lineIndex) {
     NSString* line = sakura::platform::mac::stringFromSakuraString(
         buffer.line(lineIndex).content);
-    NSString* trimmed = [line stringByTrimmingCharactersInSet:whitespace];
+    NSMutableString* code = line.mutableCopy;
+    const auto start = buffer.lineStartOffset(lineIndex);
+    while (tokenCursor < tokens.size() && tokens[tokenCursor].range.location + tokens[tokenCursor].range.length <= start) ++tokenCursor;
+    for (auto n = tokenCursor; n < tokens.size() && tokens[n].range.location < start + line.length; ++n) {
+      const auto& token = tokens[n];
+      if (token.kind != sakura::core::SyntaxTokenKind::comment && token.kind != sakura::core::SyntaxTokenKind::string) continue;
+      auto left = std::max(token.range.location, start);
+      auto right = std::min(token.range.location + token.range.length, start + line.length);
+      [code replaceCharactersInRange:NSMakeRange(left - start, right - left)
+          withString:[@"" stringByPaddingToLength:right - left withString:@" " startingAtIndex:0]];
+    }
+    NSString* trimmed = [code stringByTrimmingCharactersInSet:whitespace];
     if (trimmed.length == 0) {
       continue;
     }
@@ -1774,14 +1979,18 @@ NSView* toolbarSeparator() {
       }
       isEntry = !isControl;
     }
-    if (!isEntry) {
-      continue;
-    }
+    if (declaration) {
+      isEntry = [declaration firstMatchInString:trimmed options:0 range:NSMakeRange(0, trimmed.length)] != nil;
+    } else if (language == Language::plain || language == Language::json || language == Language::yaml ||
+               language == Language::toml || language == Language::ini || language == Language::html ||
+               language == Language::xml || language == Language::css) isEntry = NO;
+    if (!isEntry) continue;
 
-    NSString* summary = trimmed.length > 96
-                            ? [[trimmed substringToIndex:95]
+    NSString* original = [line stringByTrimmingCharactersInSet:whitespace];
+    NSString* summary = original.length > 96
+                            ? [[original substringToIndex:95]
                                   stringByAppendingString:@"…"]
-                            : trimmed;
+                            : original;
     [entries addObject:@{
       @"title" : [NSString stringWithFormat:@"%5zu  %@", lineIndex + 1,
                                                    summary],
@@ -1941,6 +2150,24 @@ NSView* toolbarSeparator() {
       NSStringFromSelector(@selector(performMiniaturize:)),
       NSStringFromSelector(@selector(performZoom:)),
       NSStringFromSelector(@selector(arrangeInFront:)),
+      @"showLineJump:", @"toggleBookmark:", @"nextBookmark:", @"previousBookmark:",
+      @"clearBookmarks:", @"showBookmarks:", @"indentWithTab:", @"unindentWithTab:",
+      @"indentWithSpaces:", @"unindentWithSpaces:", @"trimLeadingWhitespace:",
+      @"trimTrailingWhitespace:", @"sortLinesAscending:", @"sortLinesDescending:",
+      @"uniqueConsecutiveLines:", @"duplicateLogicalLines:", @"convertToHalfwidth:",
+      @"convertToFullwidthKatakana:", @"convertToFullwidthHiragana:", @"tabsToSpaces:", @"spacesToTabs:",
+      @"moveWordLeft:", @"moveWordRight:", @"pageUp:", @"pageDown:",
+      @"moveToBeginningOfLine:", @"moveToEndOfLine:",
+      @"moveWordLeftAndModifySelection:", @"moveWordRightAndModifySelection:",
+      @"pageUpAndModifySelection:", @"pageDownAndModifySelection:",
+      @"moveToBeginningOfLineAndModifySelection:", @"moveToEndOfLineAndModifySelection:",
+      @"moveToBeginningOfDocumentAndModifySelection:", @"moveToEndOfDocumentAndModifySelection:",
+      @"insertDate:", @"insertTime:", @"selectCurrentWord:", @"deleteCurrentWord:",
+      @"deleteWordToLeft:", @"deleteWordToRight:", @"deleteToLogicalLineStart:",
+      @"deleteToLogicalLineEnd:", @"deleteLogicalLines:", @"copyFileName:", @"copyFilePath:",
+      @"copyFileLocation:", @"copyWithCRLF:", @"saveAllDocuments:", @"saveAndClose:",
+      @"useSelectionForFind:", @"countSearchMatches:", @"clearSharedSearchHistory:",
+      @"cancelSearchOperations:",
     ]];
   });
   return actions;
@@ -2161,7 +2388,7 @@ NSView* toolbarSeparator() {
 }
 
 - (NSArray<NSDictionary*>*)defaultTypeColorEntries {
-  return @[
+  NSArray* entries = @[
     @{ @"title" : @"テキスト", @"foreground" : @"text",
        @"background" : @"background", @"style" : @"text",
        @"display" : @NO, @"font" : @YES },
@@ -2211,6 +2438,14 @@ NSView* toolbarSeparator() {
        @"background" : @"preprocessorBackground", @"style" : @"preprocessor",
        @"display" : @YES, @"font" : @YES },
   ];
+  NSMutableArray* result = entries.mutableCopy;
+  for (NSUInteger group = 2; group <= 10; ++group) {
+    NSString* role = SakuraKeywordRole(group);
+    [result addObject:@{@"title":[NSString stringWithFormat:@"キーワード%lu", (unsigned long)group],
+        @"foreground":role, @"background":[role stringByAppendingString:@"Background"],
+        @"style":role, @"display":@YES, @"font":@YES}];
+  }
+  return result;
 }
 
 - (NSDictionary*)selectedTypeColorEntry {
@@ -2236,6 +2471,8 @@ NSView* toolbarSeparator() {
   if ([role isEqualToString:@"comment"]) return SakuraCommentText(appearance);
   if ([role isEqualToString:@"string"]) return SakuraStringText(appearance);
   if ([role isEqualToString:@"keyword"]) return SakuraKeywordText(appearance);
+  for (NSUInteger group = 2; group <= 10; ++group)
+    if ([role isEqualToString:SakuraKeywordRole(group)]) return SakuraKeywordGroupText(group, appearance);
   if ([role isEqualToString:@"number"]) return SakuraNumberText(appearance);
   if ([role isEqualToString:@"preprocessor"]) return SakuraPreprocessorText(appearance);
   if ([role isEqualToString:@"tabMarker"]) return SakuraTabMarkerText(appearance);
@@ -2433,6 +2670,7 @@ NSView* toolbarSeparator() {
 
 - (void)cancelTypeSettings:(id)sender {
   (void)sender;
+  ++self.typeSyntaxSession;
   self.typeDisplayResetPending = NO;
   self.typeDisplayBaselineValues = nil;
   [self.typeColorTransaction cancel];
@@ -2731,10 +2969,179 @@ NSView* toolbarSeparator() {
       @"指定桁は半角文字幅を基準にします。\n既定へ戻す変更は適用／OKで保存します。その後に変更した項目だけをタイプ別に保存します。";
 }
 
+- (NSTextView*)syntaxTextViewWithFrame:(NSRect)frame inView:(NSView*)view {
+  NSScrollView* scroll = [[NSScrollView alloc] initWithFrame:frame];
+  scroll.hasVerticalScroller = YES;
+  scroll.borderType = NSBezelBorder;
+  scroll.autoresizingMask = NSViewWidthSizable;
+  NSTextView* text = [[NSTextView alloc] initWithFrame:scroll.contentView.bounds];
+  text.richText = NO; text.font = [NSFont monospacedSystemFontOfSize:12 weight:NSFontWeightRegular];
+  text.automaticQuoteSubstitutionEnabled = NO;
+  text.automaticDashSubstitutionEnabled = NO;
+  text.automaticTextReplacementEnabled = NO;
+  text.automaticSpellingCorrectionEnabled = NO;
+  text.textContainer.widthTracksTextView = YES;
+  text.verticallyResizable = YES; text.autoresizingMask = NSViewWidthSizable;
+  scroll.documentView = text; [view addSubview:scroll]; return text;
+}
+
+- (NSView*)makeTypeSyntaxSettingsViewWithFrame:(NSRect)frame {
+  NSView* view = [[NSView alloc] initWithFrame:frame];
+  CGFloat height = NSHeight(frame), width = NSWidth(frame) - 40;
+  NSTextField* groupLabel = [NSTextField labelWithString:@"色グループ:"];
+  groupLabel.frame = NSMakeRect(20, height - 30, 90, 22);
+  groupLabel.autoresizingMask = NSViewMinYMargin; [view addSubview:groupLabel];
+  self.typeSyntaxGroupPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(112, height - 33, 145, 28)];
+  for (NSUInteger group = 1; group <= 10; ++group)
+    [self.typeSyntaxGroupPopup addItemWithTitle:[NSString stringWithFormat:@"キーワード%lu", (unsigned long)group]];
+  self.typeSyntaxGroupPopup.target = self; self.typeSyntaxGroupPopup.action = @selector(syntaxGroupChanged:);
+  self.typeSyntaxGroupPopup.autoresizingMask = NSViewMinYMargin; [view addSubview:self.typeSyntaxGroupPopup];
+  NSButton* importButton = [NSButton buttonWithTitle:@".kwd 読込み…" target:self action:@selector(importKeywordGroup:)];
+  importButton.frame = NSMakeRect(NSWidth(frame) - 276, height - 33, 124, 28);
+  importButton.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin; [view addSubview:importButton];
+  NSButton* exportButton = [NSButton buttonWithTitle:@".kwd 書出し…" target:self action:@selector(exportKeywordGroup:)];
+  exportButton.frame = NSMakeRect(NSWidth(frame) - 148, height - 33, 128, 28);
+  exportButton.toolTip = @"選択グループの単語と大小文字設定をUTF-8 BOM付きで保存します。正規表現は含みません。";
+  exportButton.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin; [view addSubview:exportButton];
+  NSTextField* words = [NSTextField labelWithString:@"追加キーワード（空白／改行区切り、Unicodeの単語文字のみ）"];
+  words.frame = NSMakeRect(20, height - 63, width, 22);
+  words.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin; [view addSubview:words];
+  self.typeKeywordText = [self syntaxTextViewWithFrame:NSMakeRect(20, height - 145, width, 76) inView:view];
+  self.typeKeywordText.accessibilityLabel = @"追加キーワード";
+  self.typeKeywordText.enclosingScrollView.autoresizingMask |= NSViewMinYMargin;
+  NSTextField* patterns = [NSTextField labelWithString:@"正規表現（1行1ルール・全グループ合計8件まで）"];
+  patterns.frame = NSMakeRect(20, height - 174, width, 22);
+  patterns.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin; [view addSubview:patterns];
+  self.typePatternText = [self syntaxTextViewWithFrame:NSMakeRect(20, 90, width, MAX(24, height - 270)) inView:view];
+  self.typePatternText.accessibilityLabel = @"正規表現キーワード（1行1ルール）";
+  self.typePatternText.enclosingScrollView.autoresizingMask |= NSViewHeightSizable;
+  self.typeSyntaxCaseButton = [NSButton checkboxWithTitle:@"大文字小文字を区別する" target:nil action:nil];
+  self.typeSyntaxCaseButton.frame = NSMakeRect(20, 62, width, 24); [view addSubview:self.typeSyntaxCaseButton];
+  self.typeSyntaxStatus = [NSTextField wrappingLabelWithString:@""];
+  self.typeSyntaxStatus.frame = NSMakeRect(20, 6, width, 50);
+  self.typeSyntaxStatus.autoresizingMask = NSViewWidthSizable; [view addSubview:self.typeSyntaxStatus];
+  return view;
+}
+
+- (NSDictionary*)currentSyntaxGroupControls {
+  return @{@"keywords":self.typeKeywordText.string != nil ? self.typeKeywordText.string.copy : @"",
+           @"patterns":self.typePatternText.string != nil ? self.typePatternText.string.copy : @"",
+           @"caseSensitive":@(self.typeSyntaxCaseButton.state == NSControlStateValueOn)};
+}
+
+- (void)stashSyntaxGroupControls {
+  if (self.typeSyntaxDraftGroups.count == 10 && self.typeSyntaxGroupIndex >= 0 && self.typeSyntaxGroupIndex < 10)
+    self.typeSyntaxDraftGroups[self.typeSyntaxGroupIndex] = [self currentSyntaxGroupControls];
+}
+- (void)loadSyntaxGroupControls {
+  if (self.typeSyntaxDraftGroups.count != 10) return;
+  NSDictionary* group = self.typeSyntaxDraftGroups[self.typeSyntaxGroupIndex];
+  self.typeKeywordText.string = group[@"keywords"]; self.typePatternText.string = group[@"patterns"];
+  self.typeSyntaxCaseButton.state = [group[@"caseSensitive"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff;
+}
+- (void)syntaxGroupChanged:(id)sender {
+  (void)sender;
+  [self.typeSettingsPanel makeFirstResponder:nil]; [self stashSyntaxGroupControls];
+  self.typeSyntaxGroupIndex = std::clamp<NSInteger>(self.typeSyntaxGroupPopup.indexOfSelectedItem, 0, 9);
+  [self loadSyntaxGroupControls];
+}
+- (NSDictionary*)syntaxPreferencesFromControls {
+  [self stashSyntaxGroupControls];
+  return SakuraSyntaxPreferencesFromGroups(self.typeSyntaxDraftGroups != nil ? self.typeSyntaxDraftGroups : @[[self currentSyntaxGroupControls]]);
+}
+
+- (void)refreshTypeSyntaxSettingsControls {
+  self.typeSyntaxBaseline = SakuraSyntaxPreferences(self.typeColorIdentifier, [self typeSettingsDefaults]);
+  ++self.typeSyntaxSession;
+  self.typeSyntaxDraftGroups = [SakuraSyntaxGroups(self.typeSyntaxBaseline) mutableCopy];
+  self.typeSyntaxGroupIndex = std::clamp<NSInteger>(self.typeSyntaxGroupPopup.indexOfSelectedItem, 0, 9);
+  [self loadSyntaxGroupControls];
+  self.typeSyntaxStatus.stringValue = @"各グループの色は「カラー」で変更できます。単語を先に評価し、グループ番号・記述順で優先。適用／OKで保存。全体に時間・件数上限あり。";
+  self.typeSyntaxStatus.textColor = NSColor.secondaryLabelColor;
+}
+
+- (BOOL)importKeywordData:(NSData*)data encoding:(sakura::core::TextEncoding)encoding group:(NSUInteger)groupIndex {
+  if (groupIndex >= 10 || self.typeSyntaxDraftGroups.count != 10) return NO;
+  [self stashSyntaxGroupControls];
+  NSString* error = nil;
+  NSDictionary* imported = SakuraImportKeywordData(data, encoding,
+      [self.typeSyntaxDraftGroups[groupIndex][@"caseSensitive"] boolValue], &error);
+  NSMutableArray* candidate = self.typeSyntaxDraftGroups.mutableCopy;
+  if (imported) {
+    NSMutableDictionary* group = [candidate[groupIndex] mutableCopy];
+    group[@"keywords"] = imported[@"keywords"]; group[@"caseSensitive"] = imported[@"caseSensitive"];
+    candidate[groupIndex] = group;
+    sakura::core::CustomSyntaxRules rules;
+    error = SakuraParseSyntaxPreferences(SakuraSyntaxPreferencesFromGroups(candidate), rules);
+  }
+  if (!imported || error) {
+    self.typeSyntaxStatus.stringValue = error != nil ? error : @"キーワードを読み込めませんでした。";
+    self.typeSyntaxStatus.textColor = NSColor.systemRedColor; return NO;
+  }
+  self.typeSyntaxDraftGroups = candidate;
+  if (groupIndex == static_cast<NSUInteger>(self.typeSyntaxGroupIndex)) [self loadSyntaxGroupControls];
+  self.typeSyntaxStatus.stringValue = @"読込み済み（未適用）。正規表現は保持しています。適用／OKで保存します。";
+  self.typeSyntaxStatus.textColor = NSColor.secondaryLabelColor; return YES;
+}
+
+- (void)importKeywordGroup:(id)sender {
+  (void)sender;
+  const auto session = self.typeSyntaxSession;
+  const auto group = static_cast<NSUInteger>(self.typeSyntaxGroupIndex);
+  NSOpenPanel* panel = NSOpenPanel.openPanel;
+  panel.canChooseDirectories = NO; panel.allowsMultipleSelection = NO;
+  panel.message = @"選択グループの単語・大小文字設定を下書きへ置換します。正規表現は保持します。";
+  NSPopUpButton* encoding = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(0, 0, 240, 28)];
+  [encoding addItemsWithTitles:@[@"自動判定", @"UTF-8", @"UTF-16LE", @"UTF-16BE", @"CP932 (Shift_JIS)", @"EUC-JP", @"ISO-2022-JP"]];
+  panel.accessoryView = encoding;
+  [panel beginSheetModalForWindow:self.typeSettingsPanel completionHandler:^(NSModalResponse response) {
+    if (response != NSModalResponseOK || self.typeSyntaxSession != session) return;
+    auto read = sakura::platform::mac::readGrepFileSnapshot(
+        std::filesystem::path(panel.URL.path.fileSystemRepresentation), 256 * 1024);
+    if (!read.snapshot) {
+      self.typeSyntaxStatus.stringValue = @"読み込めません。256KiB以下の通常ファイルを指定し、権限・外部変更を確認してください。";
+      self.typeSyntaxStatus.textColor = NSColor.systemRedColor; return;
+    }
+    NSData* data = [NSData dataWithBytes:read.snapshot->bytes.data() length:read.snapshot->bytes.size()];
+    [self importKeywordData:data encoding:static_cast<sakura::core::TextEncoding>(encoding.indexOfSelectedItem) group:group];
+  }];
+}
+
+- (void)exportKeywordGroup:(id)sender {
+  (void)sender; [self stashSyntaxGroupControls];
+  NSString* error = nil;
+  NSData* data = SakuraExportKeywordData(self.typeSyntaxDraftGroups[self.typeSyntaxGroupIndex], &error);
+  if (!data) { self.typeSyntaxStatus.stringValue = error; self.typeSyntaxStatus.textColor = NSColor.systemRedColor; return; }
+  NSSavePanel* panel = NSSavePanel.savePanel;
+  panel.nameFieldStringValue = [NSString stringWithFormat:@"keyword-%ld.kwd", (long)self.typeSyntaxGroupIndex + 1];
+  panel.message = @"単語と大小文字設定のみを書き出します。正規表現・色設定は含みません。";
+  [panel beginSheetModalForWindow:self.typeSettingsPanel completionHandler:^(NSModalResponse response) {
+    if (response != NSModalResponseOK) return;
+    NSError* error = nil;
+    if (![data writeToURL:panel.URL options:NSDataWritingAtomic error:&error]) [NSApp presentError:error];
+  }];
+}
+
 - (void)applyTypeSettings:(id)sender {
   (void)sender;
+  self.typeSettingsApplySucceeded = NO;
   // Commit any field still being edited before reading its value.
   [self.typeSettingsPanel makeFirstResponder:nil];
+  NSDictionary* syntax = self.typeKeywordText != nil ? [self syntaxPreferencesFromControls] : nil;
+  if (syntax) {
+    sakura::core::CustomSyntaxRules rules;
+    NSString* error = SakuraParseSyntaxPreferences(syntax, rules);
+    if (error) {
+      NSScanner* location = [NSScanner scannerWithString:error];
+      NSInteger group = 0;
+      if ([location scanString:@"キーワード" intoString:nil] && [location scanInteger:&group] && group >= 1 && group <= 10) {
+        [self.typeSyntaxGroupPopup selectItemAtIndex:group - 1]; [self syntaxGroupChanged:nil];
+      }
+      self.typeSyntaxStatus.stringValue = error; self.typeSyntaxStatus.textColor = NSColor.systemRedColor;
+      [self.typeSettingsTabs selectTabViewItemWithIdentifier:@"正規表現キーワード"];
+      return;
+    }
+  }
   SakuraEditorSettings* settings = [self typeEditorSettingsFromControls];
   NSDictionary<NSString*, id>* values = settings.preferenceValues;
   NSDictionary<NSString*, id>* baseline = self.typeDisplayBaselineValues ?:
@@ -2753,16 +3160,22 @@ NSView* toolbarSeparator() {
   }
   [settings saveForTypeIdentifier:self.typeColorIdentifier
                          defaults:[self typeSettingsDefaults] properties:changed];
+  if (syntax) {
+    SakuraSaveSyntaxPreferences(self.typeColorIdentifier, [self typeSettingsDefaults], syntax,
+        self.typeSyntaxBaseline != nil ? self.typeSyntaxBaseline : SakuraSyntaxPreferences(self.typeColorIdentifier, [self typeSettingsDefaults]));
+    [self refreshTypeSyntaxSettingsControls];
+  }
   [self.typeColorTransaction commit];
   [self refreshTypeEditorSettingsControls];
   [self redrawEditorsForTypeColorChange];
   // Apply establishes a new cancel boundary for both display and live colors.
   [self captureTypeColorSnapshot];
+  self.typeSettingsApplySucceeded = YES;
 }
 
 - (void)acceptTypeSettings:(id)sender {
   [self applyTypeSettings:sender];
-  [self.typeSettingsPanel orderOut:self];
+  if (self.typeSettingsApplySucceeded) [self.typeSettingsPanel orderOut:self];
 }
 
 - (void)showTypeSettings:(id)sender {
@@ -2784,9 +3197,10 @@ NSView* toolbarSeparator() {
     panel.hidesOnDeactivate = NO;
     panel.floatingPanel = YES;
     panel.delegate = self;
-    panel.minSize = NSMakeSize(600, 400);
+    panel.minSize = NSMakeSize(600, 440);
     NSTabView* tabs = [[NSTabView alloc]
         initWithFrame:NSMakeRect(14, 54, 652, 412)];
+    self.typeSettingsTabs = tabs;
     tabs.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     NSTabViewItem* screenTab = [[NSTabViewItem alloc]
         initWithIdentifier:@"スクリーン"];
@@ -2806,9 +3220,10 @@ NSView* toolbarSeparator() {
     [self addSettingsTab:@"支援"
                    lines:@[@"入力補完・自動インデント", @"キーワードヘルプ"]
                       to:tabs];
-    [self addSettingsTab:@"正規表現キーワード"
-                   lines:@[@"正規表現による強調表示ルール"]
-                      to:tabs];
+    NSTabViewItem* syntaxTab = [[NSTabViewItem alloc] initWithIdentifier:@"正規表現キーワード"];
+    syntaxTab.label = @"正規表現キーワード";
+    syntaxTab.view = [self makeTypeSyntaxSettingsViewWithFrame:tabs.contentRect];
+    [tabs addTabViewItem:syntaxTab];
     [self addSettingsTab:@"キーワードヘルプ"
                    lines:@[@"辞書ファイルと表示方法"]
                       to:tabs];
@@ -2839,6 +3254,7 @@ NSView* toolbarSeparator() {
       stringWithFormat:@"タイプ別設定 - %@", [self currentTypeName]];
   self.typeSettingsPanel.appearance = self.window.appearance;
   [self refreshTypeEditorSettingsControls];
+  [self refreshTypeSyntaxSettingsControls];
   [self captureTypeColorSnapshot];
   [self.typeColorTableView reloadData];
   [self.typeColorTableView selectRowIndexes:[NSIndexSet indexSetWithIndex:0]
@@ -2982,15 +3398,31 @@ NSView* toolbarSeparator() {
   [self.encodingPanel makeKeyAndOrderFront:self];
 }
 
+- (NSUserDefaults*)commonSettingsDefaults { return NSUserDefaults.standardUserDefaults; }
+
 - (void)applyCommonSettings:(id)sender {
   (void)sender;
+  self.commonSettingsApplySucceeded = NO;
+  NSUserDefaults* defaults = [self commonSettingsDefaults];
+  if (self.commonRecoveryGenerationsField && self.commonRecoveryBudgetField) {
+    NSInteger generations = -1, budgetMiB = -1;
+    NSScanner* generationScanner = [NSScanner scannerWithString:self.commonRecoveryGenerationsField.stringValue];
+    NSScanner* budgetScanner = [NSScanner scannerWithString:self.commonRecoveryBudgetField.stringValue];
+    NSError* error = nil;
+    if (![generationScanner scanInteger:&generations] || !generationScanner.isAtEnd ||
+        ![budgetScanner scanInteger:&budgetMiB] || !budgetScanner.isAtEnd ||
+        !SakuraSetRecoverySettings(defaults, generations, budgetMiB, &error)) {
+      self.commonRecoveryStatus.stringValue = error != nil ? error.localizedDescription : @"世代数・容量は範囲内の整数で指定してください。";
+      return;
+    }
+    self.commonRecoveryStatus.stringValue = @"次回の復旧バックアップ保存から適用します。";
+  }
   const double fontSize = std::clamp(self.commonFontSizeField.doubleValue,
                                      8.0, 36.0);
   const NSInteger tabWidth = std::clamp<NSInteger>(
       self.commonTabWidthField.integerValue, 1, 16);
   self.commonFontSizeField.doubleValue = fontSize;
   self.commonTabWidthField.integerValue = tabWidth;
-  NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
   [defaults setDouble:fontSize forKey:@"SakuraEditorFontSize"];
   [defaults setInteger:tabWidth forKey:@"SakuraEditorTabWidth"];
   NSArray<NSString*>* themeValues = @[
@@ -3021,11 +3453,12 @@ NSView* toolbarSeparator() {
       [editor displaySettingsDidChange];
     }
   }
+  self.commonSettingsApplySucceeded = YES;
 }
 
 - (void)acceptCommonSettings:(id)sender {
   [self applyCommonSettings:sender];
-  [self.commonSettingsPanel orderOut:self];
+  if (self.commonSettingsApplySucceeded) [self.commonSettingsPanel orderOut:self];
 }
 
 - (NSTableView*)toolbarSettingsTableWithIdentifier:(NSString*)identifier
@@ -3270,8 +3703,7 @@ NSView* toolbarSeparator() {
   return view;
 }
 
-- (void)showCommonSettings:(id)sender {
-  (void)sender;
+- (void)prepareCommonSettingsPanel {
   if (self.commonSettingsPanel == nil) {
     NSPanel* panel = [[NSPanel alloc]
         initWithContentRect:NSMakeRect(0, 0, 660, 460)
@@ -3322,6 +3754,25 @@ NSView* toolbarSeparator() {
     [generalView addSubview:note];
     general.view = generalView;
     [tabs addTabViewItem:general];
+    NSTabViewItem* recovery = [[NSTabViewItem alloc] initWithIdentifier:@"復旧"];
+    recovery.label = @"復旧";
+    NSView* recoveryView = [[NSView alloc] initWithFrame:tabs.contentRect];
+    NSTextField* generationsLabel = [NSTextField labelWithString:@"過去の復旧世代数（0〜20）:"];
+    generationsLabel.frame = NSMakeRect(28, 292, 280, 22); [recoveryView addSubview:generationsLabel];
+    self.commonRecoveryGenerationsField = [[NSTextField alloc] initWithFrame:NSMakeRect(320, 288, 90, 26)];
+    [recoveryView addSubview:self.commonRecoveryGenerationsField];
+    NSTextField* budgetLabel = [NSTextField labelWithString:@"復旧フォルダー容量（16〜4,096 MiB）:"];
+    budgetLabel.frame = NSMakeRect(28, 250, 280, 22); [recoveryView addSubview:budgetLabel];
+    self.commonRecoveryBudgetField = [[NSTextField alloc] initWithFrame:NSMakeRect(320, 246, 90, 26)];
+    [recoveryView addSubview:self.commonRecoveryBudgetField];
+    NSTextField* recoveryNote = [NSTextField wrappingLabelWithString:
+      @"最新の復旧データは常に保持します。過去世代を減らすと、次のバックアップが正常に保存された後、その文書の古い世代を削除します。他の文書は削除しません。容量を減らして超過した場合は保存を停止し、既存データを保持します。復旧データは暗号化されません。"];
+    recoveryNote.frame = NSMakeRect(28, 112, 530, 110); [recoveryView addSubview:recoveryNote];
+    self.commonRecoveryStatus = [NSTextField wrappingLabelWithString:@""];
+    self.commonRecoveryStatus.frame = NSMakeRect(28, 44, 530, 56);
+    self.commonRecoveryStatus.textColor = NSColor.secondaryLabelColor;
+    [recoveryView addSubview:self.commonRecoveryStatus];
+    recovery.view = recoveryView; [tabs addTabViewItem:recovery];
     NSTabViewItem* windowTab = [[NSTabViewItem alloc]
         initWithIdentifier:@"ウィンドウ"];
     windowTab.label = @"ウィンドウ";
@@ -3364,9 +3815,12 @@ NSView* toolbarSeparator() {
     self.commonTabWidthField = tabField;
     self.commonThemePopup = themePopup;
   }
-  NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+  NSUserDefaults* defaults = [self commonSettingsDefaults];
   self.commonFontSizeField.doubleValue = [defaults doubleForKey:@"SakuraEditorFontSize"];
   self.commonTabWidthField.integerValue = [defaults integerForKey:@"SakuraEditorTabWidth"];
+  self.commonRecoveryGenerationsField.integerValue = SakuraRecoveryGenerations(defaults);
+  self.commonRecoveryBudgetField.integerValue = SakuraRecoveryBudgetMiB(defaults);
+  self.commonRecoveryStatus.stringValue = @"";
   self.toolbarDraftItems = [[self configuredToolbarItems] mutableCopy];
   self.toolbarFlatCheckbox.state = [defaults boolForKey:@"SakuraToolbarFlat"]
       ? NSControlStateValueOn : NSControlStateValueOff;
@@ -3381,6 +3835,11 @@ NSView* toolbarSeparator() {
   NSInteger themeIndex = [theme isEqualToString:SakuraEditorColorThemeSystem]
       ? 1 : ([theme isEqualToString:SakuraEditorColorThemeDark] ? 2 : 0);
   [self.commonThemePopup selectItemAtIndex:themeIndex];
+}
+
+- (void)showCommonSettings:(id)sender {
+  (void)sender;
+  [self prepareCommonSettingsPanel];
   [self.commonSettingsPanel makeKeyAndOrderFront:self];
 }
 
@@ -3595,6 +4054,12 @@ NSView* toolbarSeparator() {
   }
   self.statusEncoding.stringValue = stringFromUtf8(
       sakura::core::EncodingService::name(document.documentSession.encodingState().encoding));
+  const bool ambiguousEncoding = document.documentSession.sourceEncodingDetection().ambiguous;
+  if (ambiguousEncoding)
+    self.statusEncoding.stringValue = [@"? " stringByAppendingString:self.statusEncoding.stringValue];
+  self.statusEncoding.toolTip = ambiguousEncoding
+      ? @"読込時の文字コードは推定です。バイト構造上はCP932／EUC-JPの両方が候補です。保存前に表示を確認し、必要なら「文字コードを指定して再読込」を実行してください。"
+      : self.statusEncoding.stringValue;
   self.statusCharCode.stringValue = @"";
   if (selection.location < buffer.length()) {
     const auto remaining = buffer.length() - selection.location;
@@ -3621,6 +4086,17 @@ NSView* toolbarSeparator() {
       : [NSString stringWithFormat:[editor hasRectangularSelection]
             ? @"%@  (矩形 %lu 文字選択)" : @"%@  (%lu 文字選択)",
           baseMessage, (unsigned long)selectedCount];
+  if (ambiguousEncoding)
+    self.statusMessage.stringValue = [self.statusMessage.stringValue stringByAppendingString:@"  [読込文字コードは推定・保存前に確認]"];
+  if (editor.syntaxStatus.length)
+    self.statusMessage.stringValue = [self.statusMessage.stringValue stringByAppendingFormat:@"  [%@]", editor.syntaxStatus];
+  if (editor.customSyntaxStatus.length)
+    self.statusMessage.stringValue = [self.statusMessage.stringValue stringByAppendingFormat:@"  [%@]", editor.customSyntaxStatus];
+  if (editor.searchHighlightStatus.length)
+    self.statusMessage.stringValue = [self.statusMessage.stringValue stringByAppendingFormat:@"  [%@]", editor.searchHighlightStatus];
+  if (editor.searchOperationStatus.length)
+    self.statusMessage.stringValue = [self.statusMessage.stringValue stringByAppendingFormat:@"  [検索: %@]", editor.searchOperationStatus];
+  self.statusMessage.toolTip = self.statusMessage.stringValue;
 }
 
 - (void)showWindow:(id)sender {

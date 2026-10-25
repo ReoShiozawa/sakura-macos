@@ -93,18 +93,28 @@ LayoutResult LayoutEngine::layout(const TextBuffer& buffer,
                                   const ITextMetrics& metrics,
                                   const FontStyle& style,
                                   const LayoutOptions& options) const {
+  return layoutLines(buffer, 0, buffer.lineCount(), metrics, style, options);
+}
+
+LayoutResult LayoutEngine::layoutLines(const TextBuffer& buffer,
+    std::size_t firstLine, std::size_t lineCount, const ITextMetrics& metrics,
+    const FontStyle& style, const LayoutOptions& options, const std::function<bool()>& cancelled) const {
+  if (firstLine > buffer.lineCount() || lineCount > buffer.lineCount() - firstLine)
+    throw std::out_of_range("layout logical-line range is outside the buffer");
   LayoutResult result;
   // Every logical line contributes at least one visual line. Reserving that
   // lower bound avoids repeated copies of millions of line descriptors.
-  result.visualLines.reserve(buffer.lineCount());
+  result.visualLines.reserve(lineCount);
   result.lineHeight = nonNegative(metrics.lineHeight(style));
   const auto configuredTabWidth = std::max<TextOffset>(1, options.tabWidth);
   const float spaceAdvance = nonNegative(metrics.advance(u' ', style));
   const float tabStop = spaceAdvance * static_cast<float>(configuredTabWidth);
   GraphemeMatcher graphemes(nullptr, uregex_close);
 
-  for (std::size_t lineIndex = 0; lineIndex < buffer.lineCount(); ++lineIndex) {
-    const auto& logical = buffer.line(lineIndex).content;
+  auto cursor = buffer.lineCursor(firstLine);
+  for (std::size_t lineIndex = firstLine; lineIndex < firstLine + lineCount; ++lineIndex, cursor.advance()) {
+    if (cancelled && cancelled()) throw std::runtime_error("layout cancelled");
+    const auto& logical = cursor.line().content;
     if (logical.empty()) {
       result.visualLines.push_back({lineIndex, 0, 0, 0.0F, result.lineHeight});
       continue;
@@ -116,8 +126,13 @@ LayoutResult LayoutEngine::layout(const TextBuffer& buffer,
     bool graphemesBound = false;
     const auto* characters = logical.data();
     const auto length = logical.size();
+    TextOffset nextCancellationCheck = 0;
 
     while (column < length) {
+      if (column >= nextCancellationCheck) {
+        if (cancelled && cancelled()) throw std::runtime_error("layout cancelled");
+        nextCancellationCheck = column + 1024;
+      }
       const auto index = static_cast<std::size_t>(column);
       const auto character = characters[index];
       TextOffset characterLength = 1;

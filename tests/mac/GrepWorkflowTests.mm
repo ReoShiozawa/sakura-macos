@@ -16,6 +16,8 @@
 - (void)executeGrepReplace:(id)sender;
 - (void)prepareGrepPanel;
 - (NSUserDefaults*)grepDefaults;
+- (BOOL)grepResultIsCurrent:(NSDictionary*)result;
+- (NSString*)grepResultText;
 @end
 
 static NSUserDefaults* testGrepDefaults;
@@ -68,9 +70,15 @@ SakuraWindowController* makeController(NSString* directory) {
   [controller setValue:[[NSSearchField alloc] init] forKey:@"grepQueryField"];
   for (NSString* key in @[@"grepCaseSensitiveButton", @"grepRegexButton",
                           @"grepRecursiveButton", @"grepBackupButton",
-                          @"grepRunButton", @"grepReplaceButton"]) {
+                          @"grepRunButton", @"grepReplaceButton", @"grepWholeWordButton"]) {
     [controller setValue:[[NSButton alloc] init] forKey:key];
   }
+  NSPopUpButton* encoding = [[NSPopUpButton alloc] init];
+  for (NSUInteger i = 0; i <= 6; ++i) {
+    [encoding addItemWithTitle:[NSString stringWithFormat:@"%lu", (unsigned long)i]];
+    encoding.lastItem.representedObject = @(i);
+  }
+  [controller setValue:encoding forKey:@"grepEncodingPopup"];
   [controller setValue:[[NSTableView alloc] init] forKey:@"grepTableView"];
   [controller setValue:[[NSPanel alloc] init] forKey:@"grepPanel"];
   [controller setValue:@YES forKey:@"grepReplaceMode"];
@@ -88,6 +96,61 @@ void waitForSearch(SakuraWindowController* controller) {
     NSString* status = ((NSTextField*)[controller valueForKey:@"grepStatusLabel"]).stringValue;
     return ![status hasPrefix:@"検索中"];
   }), "preview completed");
+}
+
+void preview(SakuraWindowController* controller);
+void unicodeEncodingAndFilters(NSString* directory) {
+  NSString* first = [directory stringByAppendingPathComponent:@"a.txt"];
+  write(first, @"Straße STRASSE strassex");
+  write([directory stringByAppendingPathComponent:@"skip.txt"], @"STRASSE");
+  SakuraWindowController* controller = makeController(directory);
+  [controller setValue:@NO forKey:@"grepReplaceMode"];
+  ((NSButton*)[controller valueForKey:@"grepRegexButton"]).state = NSControlStateValueOff;
+  ((NSButton*)[controller valueForKey:@"grepWholeWordButton"]).state = NSControlStateValueOn;
+  ((NSTextField*)[controller valueForKey:@"grepQueryField"]).stringValue = @"STRASSE";
+  ((NSTextField*)[controller valueForKey:@"grepPatternField"]).stringValue = @"*.txt;!skip*";
+  [controller startGrep:nil]; waitForSearch(controller);
+  expect([[controller valueForKey:@"grepResults"] count] == 2,
+         "Grep uses Unicode folding, whole words and exclusion patterns");
+  expect([[controller grepResultText] containsString:@"a.txt:1:1:"], "export includes source location");
+  NSDictionary* original = [[controller valueForKey:@"grepResults"] firstObject];
+  expect([controller grepResultIsCurrent:original], "unchanged result is current");
+  write(first, @"changed file content");
+  expect(![controller grepResultIsCurrent:original], "changed result cannot jump to stale offset");
+  NSString* utf16 = [directory stringByAppendingPathComponent:@"utf16.txt"];
+  NSData* data = [@"日本語STRASSE\r\n" dataUsingEncoding:NSUTF16LittleEndianStringEncoding];
+  expect([data writeToFile:utf16 atomically:YES], "write UTF16 without BOM fixture");
+  ((NSTextField*)[controller valueForKey:@"grepPatternField"]).stringValue = @"utf16.txt";
+  NSPopUpButton* encoding = [controller valueForKey:@"grepEncodingPopup"];
+  [encoding selectItemAtIndex:2];
+  ((NSButton*)[controller valueForKey:@"grepWholeWordButton"]).state = NSControlStateValueOff;
+  [controller startGrep:nil]; waitForSearch(controller);
+  NSArray* results = [controller valueForKey:@"grepResults"];
+  expect(results.count == 1 && [results.firstObject[@"encoding"] integerValue] == 2,
+         "explicit UTF16 without BOM bypasses raw-NUL binary heuristic");
+  expect([testGrepDefaults integerForKey:@"SakuraGrepEncoding"] == 2, "encoding choice persists in isolated defaults");
+  [encoding selectItemAtIndex:0];
+  [controller startGrep:nil]; waitForSearch(controller);
+  expect([[controller valueForKey:@"grepResults"] count] == 0, "automatic mode skips raw binary");
+  expect([((NSTextField*)[controller valueForKey:@"grepStatusLabel"]).stringValue containsString:@"バイナリ1"],
+         "skipped binary file is reported");
+  write(first, @"STRASSE");
+  ((NSTextField*)[controller valueForKey:@"grepPatternField"]).stringValue = @"a.txt";
+  ((NSTextField*)[controller valueForKey:@"grepReplacementField"]).stringValue = @"changed";
+  [controller setValue:@YES forKey:@"grepReplaceMode"];
+  preview(controller);
+  [encoding selectItemAtIndex:4];
+  [controller executeGrepReplace:nil];
+  expect([read(first) isEqual:@"STRASSE"], "encoding change invalidates frozen replacement candidates");
+  NSString* large = [directory stringByAppendingPathComponent:@"large.txt"];
+  expect([NSFileManager.defaultManager createFileAtPath:large contents:NSData.data attributes:nil], "create large fixture");
+  NSFileHandle* handle = [NSFileHandle fileHandleForWritingAtPath:large];
+  [handle truncateFileAtOffset:32ULL * 1024 * 1024 + 1]; [handle closeFile];
+  [encoding selectItemAtIndex:0];
+  ((NSTextField*)[controller valueForKey:@"grepPatternField"]).stringValue = @"a.txt;large.txt";
+  [controller startGrep:nil]; waitForSearch(controller);
+  expect(![[controller valueForKey:@"grepPreviewReady"] boolValue], "oversized file prevents incomplete replacement execution");
+  expect([((NSTextField*)[controller valueForKey:@"grepStatusLabel"]).stringValue containsString:@"大容量除外1"], "oversized exclusion is visible");
 }
 
 void preview(SakuraWindowController* controller) {
@@ -328,6 +391,45 @@ void refusesIncompleteAndFailedPreviews(NSString* directory) {
   expect([read(path) isEqualToString:[text stringByAppendingString:@"b"]],
          "failed preview leaves source unchanged");
 }
+
+void ambiguousJapaneseRequiresExplicitEncodingForBulkWrite(NSString* directory) {
+  NSString* path = [directory stringByAppendingPathComponent:@"euc.txt"];
+  NSString* plain = [directory stringByAppendingPathComponent:@"plain.txt"];
+  const unsigned char original[] = {0xa4, 0xa2, ' ', 'i', 't', 'e', 'm', '-', '4', '2', '\r', '\n'};
+  NSData* data = [NSData dataWithBytes:original length:sizeof(original)];
+  expect([data writeToFile:path atomically:YES], "write independent ambiguous EUC fixture");
+  write(plain, @"item-42");
+  auto* controller = makeController(directory);
+  [controller startGrep:nil]; waitForSearch(controller);
+  NSArray* results = [controller valueForKey:@"grepResults"];
+  expect(results.count == 2, "ambiguous input remains searchable");
+  NSDictionary* inferred = nil;
+  for (NSDictionary* result in results) if ([((NSURL*)result[@"url"]).path isEqual:path]) inferred = result;
+  expect(inferred && [inferred[@"encoding"] integerValue] == 5 &&
+         [inferred[@"requestedEncoding"] integerValue] == 0 && [inferred[@"ambiguousEncoding"] boolValue] &&
+         [inferred[@"title"] containsString:@"文字コード要確認"],
+         "Grep result preserves inferred encoding, original auto request and warning");
+  expect(![[controller valueForKey:@"grepPreviewReady"] boolValue] &&
+         !((NSButton*)[controller valueForKey:@"grepReplaceButton"]).enabled,
+         "an ambiguous matching file disables the entire bulk write");
+  expect([((NSTextField*)[controller valueForKey:@"grepStatusLabel"]).stringValue containsString:@"文字コードを指定"],
+         "ambiguous preview explains how to proceed");
+  [controller executeGrepReplace:nil];
+  expect([[NSData dataWithContentsOfFile:path] isEqual:data] && [read(plain) isEqual:@"item-42"],
+         "no partial write of otherwise unambiguous candidates");
+  NSPopUpButton* encoding = [controller valueForKey:@"grepEncodingPopup"];
+  [encoding selectItemAtIndex:5];
+  preview(controller);
+  for (NSDictionary* result in [controller valueForKey:@"grepResults"])
+    expect(![result[@"ambiguousEncoding"] boolValue] && [result[@"requestedEncoding"] integerValue] == 5,
+           "explicit EUC preview records user's encoding choice");
+  execute(controller);
+  const unsigned char replaced[] = {0xa4, 0xa2, ' ', '[', '4', '2', ']', '\r', '\n'};
+  expect([[NSData dataWithContentsOfFile:path] isEqual:[NSData dataWithBytes:replaced length:sizeof(replaced)]],
+         "explicit EUC replacement preserves original legacy characters and CRLF");
+  expect([[NSData dataWithContentsOfFile:[path stringByAppendingString:@".bak"]] isEqual:data],
+         "explicit replacement backs up exact ambiguous source bytes");
+}
 }  // namespace
 
 int main() {
@@ -341,7 +443,7 @@ int main() {
     NSString* root = [NSTemporaryDirectory() stringByAppendingPathComponent:
         [@"sakura-grep-workflow-" stringByAppendingString:NSUUID.UUID.UUIDString]];
     for (NSString* part in @[@"frozen", @"opened", @"limits", @"directories",
-                             @"outside", @"validation"]) {
+                             @"outside", @"validation", @"features", @"encoding"]) {
       [[NSFileManager defaultManager] createDirectoryAtPath:
           [root stringByAppendingPathComponent:part]
           withIntermediateDirectories:YES attributes:nil error:nil];
@@ -353,6 +455,8 @@ int main() {
         [root stringByAppendingPathComponent:@"directories"],
         [root stringByAppendingPathComponent:@"outside"]);
     validatesAndPersistsExclusions([root stringByAppendingPathComponent:@"validation"]);
+    unicodeEncodingAndFilters([root stringByAppendingPathComponent:@"features"]);
+    ambiguousJapaneseRequiresExplicitEncodingForBulkWrite([root stringByAppendingPathComponent:@"encoding"]);
     for (NSDocument* document in [NSDocumentController.sharedDocumentController.documents copy]) {
       [document close];
       [NSDocumentController.sharedDocumentController removeDocument:document];

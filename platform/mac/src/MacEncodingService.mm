@@ -1,10 +1,16 @@
 // Copyright (c) 2026 Unofficial Sakura macOS port contributors
+// Copyright (C) 2006, 2007, 2018-2022, Sakura Editor Organization
 // SPDX-License-Identifier: Zlib
+// The byte-evidence tie breaker is an altered port of CESI::GuessEucOrSjis
+// and codechecker.h. This is not the original Windows detector implementation.
 
 #include "sakura/platform/mac/MacEncodingService.h"
 
 #import <CoreFoundation/CoreFoundation.h>
 #import <CoreFoundation/CFStringEncodingExt.h>
+#import <Foundation/Foundation.h>
+
+#include <algorithm>
 
 #include "sakura/core/encoding/Utf8Codec.h"
 
@@ -79,6 +85,98 @@ bool hasValidIso2022JapaneseText(std::span<const std::byte> data) noexcept {
   return hasJapaneseDesignation && !awaitingSecondByte;
 }
 
+struct JapaneseByteEvidence {
+  bool valid{true};
+  std::size_t encodedBytes{};
+  std::size_t kanaBytes{};
+  std::size_t halfKanaBytes{};
+};
+
+JapaneseByteEvidence japaneseByteEvidence(std::span<const std::byte> data,
+                                         core::TextEncoding encoding) noexcept {
+  JapaneseByteEvidence evidence;
+  const auto byteAt = [data](std::size_t offset) {
+    return std::to_integer<unsigned char>(data[offset]);
+  };
+  const auto eucTrail = [](unsigned char value) { return value >= 0xA1 && value <= 0xFE; };
+  for (std::size_t cursor = 0; cursor < data.size();) {
+    const auto first = byteAt(cursor);
+    if (first < 0x80) { ++cursor; continue; }
+    std::size_t width = 1;
+    if (encoding == core::TextEncoding::shiftJis) {
+      if ((first >= 0x81 && first <= 0x9F) || (first >= 0xE0 && first <= 0xFC)) {
+        if (data.size() - cursor < 2) return {false};
+        const auto second = byteAt(cursor + 1);
+        if (!((second >= 0x40 && second <= 0x7E) || (second >= 0x80 && second <= 0xFC)))
+          return {false};
+        width = 2;
+      }
+      // CP932 also has single-byte extensions at 80/A0/FD/FE/FF. The final
+      // Core Foundation conversion must still validate the actual mapping.
+    } else {
+      if (first == 0x8F) {
+        width = 3;
+        if (data.size() - cursor < width || !eucTrail(byteAt(cursor + 1)) ||
+            !eucTrail(byteAt(cursor + 2))) return {false};
+      } else if (first == 0x8E) {
+        width = 2;
+        if (data.size() - cursor < width || byteAt(cursor + 1) < 0xA1 ||
+            byteAt(cursor + 1) > 0xDF) return {false};
+        evidence.halfKanaBytes += width;
+      } else {
+        width = 2;
+        if (!eucTrail(first) || data.size() - cursor < width ||
+            !eucTrail(byteAt(cursor + 1))) return {false};
+        const auto second = byteAt(cursor + 1);
+        if ((first == 0xA4 && second <= 0xF3) || (first == 0xA5 && second <= 0xF6))
+          evidence.kanaBytes += width;
+      }
+    }
+    evidence.encodedBytes += width;
+    cursor += width;
+  }
+  return evidence;
+}
+
+core::TextEncoding platformJapaneseGuess(std::span<const std::byte> data) {
+  // The Foundation detector is a hint, never the decoder or a validator. Bound
+  // the OS's analysis and avoid a large extra string/copy in a file-open path.
+  auto sample = data.first(std::min<std::size_t>(data.size(), 64U * 1024U));
+  for (int attempt = 0; attempt < 3 && !sample.empty(); ++attempt) {
+    if (japaneseByteEvidence(sample, core::TextEncoding::shiftJis).valid &&
+        japaneseByteEvidence(sample, core::TextEncoding::eucJp).valid) break;
+    sample = sample.first(sample.size() - 1);
+  }
+  if (sample.size() < 32 ||
+      !japaneseByteEvidence(sample, core::TextEncoding::shiftJis).valid ||
+      !japaneseByteEvidence(sample, core::TextEncoding::eucJp).valid)
+    return core::TextEncoding::automatic;
+
+  @autoreleasepool {
+    NSData* input = [NSData dataWithBytesNoCopy:const_cast<std::byte*>(sample.data())
+                                       length:sample.size() freeWhenDone:NO];
+    const auto sjis = CFStringConvertEncodingToNSStringEncoding(kCFStringEncodingDOSJapanese);
+    const auto euc = CFStringConvertEncodingToNSStringEncoding(kCFStringEncodingEUC_JP);
+    NSStringEncoding guesses[2]{};
+    for (int order = 0; order < 2; ++order) {
+      // Suggested-encoding order itself influences Foundation's preference.
+      // Accept a hint only when reversing that order gives the same answer.
+      BOOL lossy = NO;
+      guesses[order] = [NSString stringEncodingForData:input encodingOptions:@{
+        NSStringEncodingDetectionSuggestedEncodingsKey: order == 0 ? @[@(sjis), @(euc)] : @[@(euc), @(sjis)],
+        NSStringEncodingDetectionUseOnlySuggestedEncodingsKey: @YES,
+        NSStringEncodingDetectionAllowLossyKey: @NO,
+        NSStringEncodingDetectionLikelyLanguageKey: @"ja"
+      } convertedString:nullptr usedLossyConversion:&lossy];
+      if (lossy) return core::TextEncoding::automatic;
+    }
+    if (guesses[0] != guesses[1]) return core::TextEncoding::automatic;
+    if (guesses[0] == sjis) return core::TextEncoding::shiftJis;
+    if (guesses[0] == euc) return core::TextEncoding::eucJp;
+  }
+  return core::TextEncoding::automatic;
+}
+
 core::TextDecodeResult decodeLegacy(std::span<const std::byte> data,
                                     core::TextEncoding encoding) {
   const auto cfEncoding = coreFoundationEncoding(encoding);
@@ -150,7 +248,9 @@ bool isLegacyEncoding(core::TextEncoding encoding) noexcept {
 core::TextDecodeResult MacEncodingService::decode(
     std::span<const std::byte> data, core::TextEncoding requestedEncoding) const {
   if (isLegacyEncoding(requestedEncoding)) {
-    return decodeLegacy(data, requestedEncoding);
+    auto result = decodeLegacy(data, requestedEncoding);
+    result.detection.method = core::EncodingDetectionMethod::explicitEncoding;
+    return result;
   }
 
   if (requestedEncoding != core::TextEncoding::automatic) {
@@ -169,18 +269,54 @@ core::TextDecodeResult MacEncodingService::decode(
   if (hasValidIso2022JapaneseText(data)) {
     auto iso2022 = decodeLegacy(data, core::TextEncoding::iso2022Jp);
     if (iso2022.ok()) {
+      iso2022.detection.method = core::EncodingDetectionMethod::iso2022Escape;
       return iso2022;
     }
   }
   if (portable.ok()) {
     return portable;
   }
-  for (const auto candidate : {core::TextEncoding::shiftJis,
-                               core::TextEncoding::eucJp}) {
-    auto decoded = decodeLegacy(data, candidate);
-    if (decoded.ok()) {
-      return decoded;
+  const auto sjis = japaneseByteEvidence(data, core::TextEncoding::shiftJis);
+  const auto euc = japaneseByteEvidence(data, core::TextEncoding::eucJp);
+  const bool ambiguous = sjis.valid && euc.valid;
+  auto preferred = core::TextEncoding::shiftJis;
+  auto method = core::EncodingDetectionMethod::bytePattern;
+  if (!sjis.valid && euc.valid) preferred = core::TextEncoding::eucJp;
+  if (ambiguous) {
+    method = core::EncodingDetectionMethod::fallback;
+    // CESI counts encoded bytes and, on a tie, promotes EUC-JP when at least
+    // 25% of those bytes encode full-width hiragana/katakana. This is evidence,
+    // not certainty: the same bytes may intentionally encode CP932 half-kana.
+    if (euc.encodedBytes > sjis.encodedBytes ||
+        (euc.encodedBytes == sjis.encodedBytes && euc.encodedBytes != 0 &&
+         (euc.kanaBytes >= euc.encodedBytes / 4 + (euc.encodedBytes % 4 != 0) ||
+          // Extension to CESI: repeated SS2 half-kana are also useful evidence.
+          // A single 8E xx is not enough (it can be an ordinary CP932 kanji).
+          (euc.halfKanaBytes >= 8 &&
+           euc.halfKanaBytes >= euc.encodedBytes / 2 + (euc.encodedBytes % 2 != 0))))) {
+      preferred = core::TextEncoding::eucJp;
+      method = core::EncodingDetectionMethod::japaneseHeuristic;
+    } else if (sjis.encodedBytes > euc.encodedBytes) {
+      method = core::EncodingDetectionMethod::japaneseHeuristic;
+    } else {
+      const auto guess = platformJapaneseGuess(data);
+      if (guess != core::TextEncoding::automatic) {
+        preferred = guess;
+        method = core::EncodingDetectionMethod::platformHeuristic;
+      }
     }
+  }
+  auto decoded = decodeLegacy(data, preferred);
+  if (decoded.ok()) {
+    decoded.detection = {method, ambiguous};
+    return decoded;
+  }
+  const auto other = preferred == core::TextEncoding::shiftJis
+      ? core::TextEncoding::eucJp : core::TextEncoding::shiftJis;
+  auto alternative = decodeLegacy(data, other);
+  if (alternative.ok()) {
+    alternative.detection.method = core::EncodingDetectionMethod::bytePattern;
+    return alternative;
   }
   return portable;
 }

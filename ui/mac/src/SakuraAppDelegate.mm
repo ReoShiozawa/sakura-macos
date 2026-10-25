@@ -4,6 +4,8 @@
 #import "SakuraAppDelegate.h"
 
 #import "SakuraDocument.h"
+#import "SakuraEditorView.h"
+#import "SakuraRecoveryWriter.h"
 
 namespace {
 
@@ -32,9 +34,35 @@ NSMenuItem* addDisabledMenuItem(NSMenu* menu, NSString* title) {
 }
 
 void addDisabledItems(NSMenu* menu, NSArray<NSString*>* titles) {
+  // These navigation handlers already exist in the editor. Wire both the
+  // native and in-window menus instead of leaving keyboard-only operations grey.
+  NSDictionary<NSString*, NSString*>* navigation = @{
+    @"単語の左端に移動":@"moveWordLeft:", @"単語の右端に移動":@"moveWordRight:",
+    @"１ページアップ":@"pageUp:", @"１ページダウン":@"pageDown:",
+    @"行頭に移動(折り返し単位)":@"moveToBeginningOfLine:",
+    @"行末に移動(折り返し単位)":@"moveToEndOfLine:",
+    @"(選択)単語の左端に移動":@"moveWordLeftAndModifySelection:",
+    @"(選択)単語の右端に移動":@"moveWordRightAndModifySelection:",
+    @"(選択)１ページアップ":@"pageUpAndModifySelection:",
+    @"(選択)１ページダウン":@"pageDownAndModifySelection:",
+    @"(選択)行頭に移動(折り返し単位)":@"moveToBeginningOfLineAndModifySelection:",
+    @"(選択)行末に移動(折り返し単位)":@"moveToEndOfLineAndModifySelection:",
+    @"(選択)ファイルの先頭に移動":@"moveToBeginningOfDocumentAndModifySelection:",
+    @"(選択)ファイルの最後に移動":@"moveToEndOfDocumentAndModifySelection:",
+    @"日付挿入":@"insertDate:", @"時刻挿入":@"insertTime:",
+    @"現在位置の単語選択":@"selectCurrentWord:", @"単語削除":@"deleteCurrentWord:",
+    @"単語の左端まで削除":@"deleteWordToLeft:", @"単語の右端まで削除":@"deleteWordToRight:",
+    @"行頭まで削除(改行単位)":@"deleteToLogicalLineStart:",
+    @"行末まで削除(改行単位)":@"deleteToLogicalLineEnd:",
+    @"このファイル名をコピー":@"copyFileName:", @"このファイルのパス名をコピー":@"copyFilePath:",
+    @"このファイルのパス名とカーソル位置をコピー":@"copyFileLocation:",
+    @"CRLF改行でコピー":@"copyWithCRLF:",
+  };
   for (NSString* title in titles) {
     if ([title isEqualToString:@"-"]) {
       addMenuSeparator(menu);
+    } else if (navigation[title]) {
+      addMenuItem(menu, title, NSSelectorFromString(navigation[title]), @"");
     } else {
       addDisabledMenuItem(menu, title);
     }
@@ -66,7 +94,105 @@ void openURLs(NSDocumentController* controller, NSArray<NSURL*>* urls) {
 
 }  // namespace
 
+@interface SakuraAppDelegate ()
+@property(nonatomic, copy) NSArray<NSDocument*>* pendingSaveDocuments;
+@property(nonatomic) NSUInteger pendingSaveIndex;
+@property(nonatomic) BOOL savingAllDocuments;
+@property(nonatomic, strong) NSApplication* pendingTerminationApplication;
+@end
+
 @implementation SakuraAppDelegate
+
+- (NSArray<NSDocument*>*)documentsForSaveAll {
+  return NSDocumentController.sharedDocumentController.documents;
+}
+
+- (void)saveAllDocuments:(id)sender {
+  (void)sender;
+  if (self.savingAllDocuments) return;
+  self.savingAllDocuments = YES;
+  self.pendingSaveDocuments = [[self documentsForSaveAll] copy];
+  self.pendingSaveIndex = 0;
+  [self saveNextDocument];
+}
+
+- (void)saveNextDocument {
+  while (self.pendingSaveIndex < self.pendingSaveDocuments.count) {
+    NSDocument* document = self.pendingSaveDocuments[self.pendingSaveIndex++];
+    if (![[self documentsForSaveAll] containsObject:document]) continue;
+    if ([document isKindOfClass:SakuraDocument.class])
+      [(SakuraDocument*)document commitPendingInput];
+    if (!document.isDocumentEdited) continue;
+    [document saveDocumentWithDelegate:self
+                      didSaveSelector:@selector(saveAllDocument:didSave:contextInfo:)
+                          contextInfo:nullptr];
+    return;
+  }
+  self.pendingSaveDocuments = nil;
+  self.savingAllDocuments = NO;
+}
+
+- (void)saveAllDocument:(NSDocument*)document didSave:(BOOL)didSave contextInfo:(void*)context {
+  (void)context;
+  if (!didSave || document.isDocumentEdited) {
+    // Cancellation, failure, or edits after the save snapshot stop the queue.
+    // Already saved documents are not rolled back.
+    self.pendingSaveDocuments = nil;
+    self.savingAllDocuments = NO;
+    return;
+  }
+  dispatch_async(dispatch_get_main_queue(), ^{ [self saveNextDocument]; });
+}
+
+- (NSArray<NSURL*>*)recentDocumentURLs {
+  return NSDocumentController.sharedDocumentController.recentDocumentURLs;
+}
+
+- (void)menuNeedsUpdate:(NSMenu*)menu {
+  BOOL folders = [menu.title isEqualToString:@"最近使ったフォルダー"];
+  if (!folders && ![menu.title isEqualToString:@"最近使ったファイル"]) return;
+  [menu removeAllItems];
+  NSMutableSet<NSString*>* seen = [NSMutableSet set];
+  for (NSURL* recent in [self recentDocumentURLs]) {
+    if (!recent.isFileURL) continue;
+    NSURL* url = folders ? recent.URLByDeletingLastPathComponent : recent;
+    if ([seen containsObject:url.path]) continue;
+    [seen addObject:url.path];
+    NSMenuItem* item = addMenuItem(menu, url.path.stringByAbbreviatingWithTildeInPath,
+        folders ? @selector(openRecentFolder:) : @selector(openRecentDocument:), @"");
+    item.target = self;
+    item.representedObject = url;
+    item.toolTip = url.path;
+    if (seen.count >= 20) break;
+  }
+  if (!seen.count) addDisabledMenuItem(menu, @"（履歴なし）");
+  addMenuSeparator(menu);
+  addMenuItem(menu, @"履歴を消去", @selector(clearRecentHistory:), @"").target = self;
+}
+
+- (void)openRecentDocument:(NSMenuItem*)sender {
+  NSURL* url = [sender.representedObject isKindOfClass:NSURL.class] ? sender.representedObject : nil;
+  if (!url.isFileURL) { NSBeep(); return; }
+  openURLs(NSDocumentController.sharedDocumentController, @[url]);
+}
+
+- (void)openRecentFolder:(NSMenuItem*)sender {
+  NSURL* url = [sender.representedObject isKindOfClass:NSURL.class] ? sender.representedObject : nil;
+  if (!url.isFileURL) { NSBeep(); return; }
+  NSOpenPanel* panel = NSOpenPanel.openPanel;
+  panel.directoryURL = url;
+  panel.allowsMultipleSelection = YES;
+  panel.canChooseDirectories = NO;
+  panel.canChooseFiles = YES;
+  [panel beginWithCompletionHandler:^(NSModalResponse response) {
+    if (response == NSModalResponseOK)
+      openURLs(NSDocumentController.sharedDocumentController, panel.URLs);
+  }];
+}
+
+- (void)clearRecentHistory:(id)sender {
+  [NSDocumentController.sharedDocumentController clearRecentDocuments:sender];
+}
 
 - (void)applicationWillFinishLaunching:(NSNotification*)notification {
   (void)notification;
@@ -114,6 +240,59 @@ void openURLs(NSDocumentController* controller, NSArray<NSURL*>* urls) {
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)sender {
   (void)sender;
   return NO;
+}
+
+- (NSDocumentController*)documentControllerForTermination {
+  return NSDocumentController.sharedDocumentController;
+}
+
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication*)sender {
+  if (self.pendingTerminationApplication) return NSTerminateLater;
+  self.pendingTerminationApplication = sender;
+  // NSApplication.terminate: asks NSDocumentController to review unsaved
+  // changes BEFORE invoking this delegate. Remaining documents were approved
+  // for discard (or are clean). Close them without asking twice. Do this
+  // synchronously so an intervening user event cannot modify reviewed text.
+  for (NSDocument* document in [self documentControllerForTermination].documents)
+    [document close];
+  // The drain callback is always asynchronous, including an empty group.
+  [self awaitRecoveryForTermination];
+  return NSTerminateLater;
+}
+
+- (void)closeDocumentsForTermination {
+  [[self documentControllerForTermination] closeAllDocumentsWithDelegate:self
+      didCloseAllSelector:@selector(documentController:didCloseForTermination:contextInfo:)
+      contextInfo:nullptr];
+}
+
+- (void)documentController:(NSDocumentController*)controller
+    didCloseForTermination:(BOOL)didClose contextInfo:(void*)context {
+  (void)controller;
+  (void)context;
+  if (!self.pendingTerminationApplication) return;
+  if (!didClose) {
+    NSApplication* application = self.pendingTerminationApplication;
+    self.pendingTerminationApplication = nil;
+    [application replyToApplicationShouldTerminate:NO];
+    return;
+  }
+  [self awaitRecoveryForTermination];
+}
+
+- (void)awaitRecoveryForTermination {
+  SakuraRecoveryWhenIdle(^{
+    if (!self.pendingTerminationApplication) return;
+    // A user can still open a document while slow I/O drains. That document
+    // must get the same close/save review, not be silently lost on exit.
+    if ([self documentControllerForTermination].documents.count != 0) {
+      [self closeDocumentsForTermination];
+      return;
+    }
+    NSApplication* application = self.pendingTerminationApplication;
+    self.pendingTerminationApplication = nil;
+    [application replyToApplicationShouldTerminate:YES];
+  });
 }
 
 - (void)application:(NSApplication*)sender openFiles:(NSArray<NSString*>*)filenames {
@@ -209,9 +388,9 @@ void openURLs(NSDocumentController* controller, NSArray<NSURL*>* urls) {
   addMenuItem(fileMenu, @"上書き保存", @selector(saveDocument:), @"s");
   NSMenuItem* saveAs = addMenuItem(fileMenu, @"名前を付けて保存...", @selector(saveDocumentAs:), @"S");
   saveAs.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift;
-  addDisabledMenuItem(fileMenu, @"すべて上書き保存");
+  addMenuItem(fileMenu, @"すべて上書き保存", @selector(saveAllDocuments:), @"").target = self;
   addMenuSeparator(fileMenu);
-  addDisabledMenuItem(fileMenu, @"保存して閉じる");
+  addMenuItem(fileMenu, @"保存して閉じる", @selector(saveAndClose:), @"");
   addMenuItem(fileMenu, @"閉じる", @selector(performClose:), @"w");
   addDisabledMenuItem(fileMenu, @"閉じて(無題)");
   addDisabledMenuItem(fileMenu, @"閉じて開く...");
@@ -223,8 +402,10 @@ void openURLs(NSDocumentController* controller, NSArray<NSURL*>* urls) {
     @"ファイルのプロパティ", @"ブラウズ", @"-"
   ]);
   NSMenu* recentFileMenu = addSubmenu(fileMenu, @"最近使ったファイル");
+  recentFileMenu.delegate = self;
   addDisabledMenuItem(recentFileMenu, @"（履歴なし）");
   NSMenu* recentFolderMenu = addSubmenu(fileMenu, @"最近使ったフォルダー");
+  recentFolderMenu.delegate = self;
   addDisabledMenuItem(recentFolderMenu, @"（履歴なし）");
   addDisabledItems(fileMenu, @[@"-", @"グループを閉じる", @"編集の全終了"]);
   addMenuItem(fileMenu, @"サクラエディタの全終了", @selector(terminate:), @"");
@@ -261,13 +442,17 @@ void openURLs(NSDocumentController* controller, NSArray<NSURL*>* urls) {
     @"行頭まで切り取り(改行単位)", @"行末まで切り取り(改行単位)", @"-",
     @"行頭まで削除(改行単位)", @"行末まで削除(改行単位)", @"-",
     @"行切り取り(折り返し単位)", @"行削除(折り返し単位)", @"-",
-    @"行の二重化(折り返し単位)", @"-", @"TABインデント",
-    @"逆TABインデント", @"SPACEインデント", @"逆SPACEインデント", @"-",
     @"選択範囲内全行コピー", @"選択範囲内全行引用符付きコピー",
     @"選択範囲内全行行番号付きコピー", @"選択範囲内色付きHTMLコピー",
     @"選択範囲内行番号色付きHTMLコピー", @"-", @"このファイル名をコピー",
     @"このファイルのパス名をコピー", @"このファイルのパス名とカーソル位置をコピー"
   ]);
+  addMenuItem(advancedMenu, @"行の二重化(改行単位)", @selector(duplicateLogicalLines:), @"");
+  addMenuItem(advancedMenu, @"行削除(改行単位)", @selector(deleteLogicalLines:), @"");
+  addMenuItem(advancedMenu, @"TABインデント", @selector(indentWithTab:), @"");
+  addMenuItem(advancedMenu, @"逆TABインデント", @selector(unindentWithTab:), @"");
+  addMenuItem(advancedMenu, @"SPACEインデント", @selector(indentWithSpaces:), @"");
+  addMenuItem(advancedMenu, @"逆SPACEインデント", @selector(unindentWithSpaces:), @"");
   NSMenu* moveMenu = addSubmenu(editMenu, @"移動");
   addDisabledItems(moveMenu, @[
     @"カーソル上移動(２行ごと)", @"カーソル下移動(２行ごと)",
@@ -281,9 +466,10 @@ void openURLs(NSDocumentController* controller, NSArray<NSURL*>* urls) {
   addMenuItem(moveMenu, @"ファイルの最後に移動",
               @selector(moveToEndOfDocument:), @"");
   addDisabledItems(moveMenu, @[
-    @"-", @"カーソル行をウィンドウ中央へ", @"-", @"指定行へジャンプ...",
+    @"-", @"カーソル行をウィンドウ中央へ", @"-",
     @"検索開始位置へ戻る", @"-"
   ]);
+  addMenuItem(moveMenu, @"指定行へジャンプ...", @selector(showLineJump:), @"l");
   addMenuItem(moveMenu, @"移動履歴: 前へ",
               @selector(goBackInNavigationHistory:), @"");
   addMenuItem(moveMenu, @"移動履歴: 次へ",
@@ -295,7 +481,7 @@ void openURLs(NSDocumentController* controller, NSArray<NSURL*>* urls) {
     @"前の関数リストマーク", @"次の変更行へ", @"前の変更行へ"
   ]);
   NSMenu* selectionMenu = addSubmenu(editMenu, @"選択");
-  addDisabledMenuItem(selectionMenu, @"現在位置の単語選択");
+  addMenuItem(selectionMenu, @"現在位置の単語選択", @selector(selectCurrentWord:), @"");
   addMenuItem(selectionMenu, @"すべて選択", @selector(selectAll:), @"");
   addDisabledItems(selectionMenu, @[
     @"範囲選択開始", @"-",
@@ -320,11 +506,13 @@ void openURLs(NSDocumentController* controller, NSArray<NSURL*>* urls) {
     @"(矩形選択)ファイルの先頭に移動", @"(矩形選択)ファイルの最後に移動"
   ]);
   NSMenu* formatMenu = addSubmenu(editMenu, @"整形");
-  addDisabledItems(formatMenu, @[
-    @"左(先頭)の空白を削除", @"右(末尾)の空白を削除", @"-",
-    @"選択行の昇順ソート", @"選択行の降順ソート", @"-",
-    @"連続した重複行の削除(uniq)"
-  ]);
+  addMenuItem(formatMenu, @"左(先頭)の空白を削除", @selector(trimLeadingWhitespace:), @"");
+  addMenuItem(formatMenu, @"右(末尾)の空白を削除", @selector(trimTrailingWhitespace:), @"");
+  addMenuSeparator(formatMenu);
+  addMenuItem(formatMenu, @"選択行の昇順ソート", @selector(sortLinesAscending:), @"");
+  addMenuItem(formatMenu, @"選択行の降順ソート", @selector(sortLinesDescending:), @"");
+  addMenuSeparator(formatMenu);
+  addMenuItem(formatMenu, @"連続した重複行の削除(uniq)", @selector(uniqueConsecutiveLines:), @"");
 
   NSMenuItem* convertRoot = [[NSMenuItem alloc] initWithTitle:@"変換"
                                                        action:nil
@@ -335,12 +523,16 @@ void openURLs(NSDocumentController* controller, NSArray<NSURL*>* urls) {
   addMenuItem(convertMenu, @"小文字", @selector(convertSelectionToLowercase:), @"");
   addMenuItem(convertMenu, @"大文字", @selector(convertSelectionToUppercase:), @"");
   addDisabledItems(convertMenu, @[
-    @"-", @"全角→半角", @"半角＋全ひら→全角・カタカナ",
-    @"半角＋全カタ→全角・ひらがな", @"全角英数→半角英数",
+    @"-", @"全角英数→半角英数",
     @"半角英数→全角英数", @"全角カタカナ→半角カタカナ",
     @"半角カタカナ→全角カタカナ", @"半角カタカナ→全角ひらがな",
-    @"-", @"TAB→空白", @"空白→TAB"
+    @"-"
   ]);
+  addMenuItem(convertMenu, @"全角→半角", @selector(convertToHalfwidth:), @"");
+  addMenuItem(convertMenu, @"半角＋全ひら→全角・カタカナ", @selector(convertToFullwidthKatakana:), @"");
+  addMenuItem(convertMenu, @"半角＋全カタ→全角・ひらがな", @selector(convertToFullwidthHiragana:), @"");
+  addMenuItem(convertMenu, @"TAB→空白", @selector(tabsToSpaces:), @"");
+  addMenuItem(convertMenu, @"空白→TAB", @selector(spacesToTabs:), @"");
   NSMenu* encodingConvertMenu = addSubmenu(convertMenu, @"文字コード変換");
   addDisabledItems(encodingConvertMenu, @[
     @"自動判別→SJISコード変換", @"E-Mail(JIS→SJIS)コード変換",
@@ -359,6 +551,9 @@ void openURLs(NSDocumentController* controller, NSArray<NSURL*>* urls) {
   NSMenu* searchMenu = [[NSMenu alloc] initWithTitle:@"検索"];
   searchRoot.submenu = searchMenu;
   addMenuItem(searchMenu, @"検索...", @selector(showFindPanel:), @"f");
+  addMenuItem(searchMenu, @"選択文字列を検索に使用", @selector(useSelectionForFind:), @"e");
+  addMenuItem(searchMenu, @"一致件数を数える", @selector(countSearchMatches:), @"");
+  addMenuItem(searchMenu, @"検索処理を中止", @selector(cancelSearchOperations:), @".");
   addMenuItem(searchMenu, @"次を検索", @selector(findNext:), @"g");
   NSMenuItem* previous = addMenuItem(searchMenu, @"前を検索",
                                      @selector(findPrevious:), @"G");
@@ -379,10 +574,11 @@ void openURLs(NSDocumentController* controller, NSArray<NSURL*>* urls) {
   ]);
   addMenuSeparator(searchMenu);
   NSMenu* bookmarkMenu = addSubmenu(searchMenu, @"ブックマーク");
-  addDisabledItems(bookmarkMenu, @[
-    @"ブックマーク設定・解除", @"次のブックマークへ", @"前のブックマークへ",
-    @"ブックマークの全解除", @"ブックマークの一覧..."
-  ]);
+  addMenuItem(bookmarkMenu, @"ブックマーク設定・解除", @selector(toggleBookmark:), @"");
+  addMenuItem(bookmarkMenu, @"次のブックマークへ", @selector(nextBookmark:), @"");
+  addMenuItem(bookmarkMenu, @"前のブックマークへ", @selector(previousBookmark:), @"");
+  addMenuItem(bookmarkMenu, @"ブックマークの全解除", @selector(clearBookmarks:), @"");
+  addMenuItem(bookmarkMenu, @"ブックマークの一覧...", @selector(showBookmarks:), @"");
   addMenuItem(searchMenu, @"Grep...", @selector(showGrepPanel:), @"");
   addMenuItem(searchMenu, @"Grep置換...",
               @selector(showGrepReplacePanel:), @"");
@@ -394,8 +590,10 @@ void openURLs(NSDocumentController* controller, NSArray<NSURL*>* urls) {
     @"タグファイルの作成...", @"ダイレクトタグジャンプ",
     @"キーワードを指定してタグジャンプ...", @"同名のC/C++ヘッダー(ソース)を開く",
     @"-", @"ファイル内容比較...", @"DIFF差分表示...", @"次の差分へ",
-    @"前の差分へ", @"差分表示の全解除", @"-", @"対括弧の検索"
+    @"前の差分へ", @"差分表示の全解除", @"-"
   ]);
+  // The Windows Ctrl+] command maps to Command+] on macOS.
+  addMenuItem(searchMenu, @"対括弧の検索", @selector(jumpToMatchingBracket:), @"]");
 
   NSMenuItem* viewRoot = [[NSMenuItem alloc] initWithTitle:@"ツール"
                                                     action:nil
